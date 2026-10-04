@@ -19,10 +19,22 @@ struct Entity {
     atk: i32,
 }
 
+struct Item {
+    x: usize,
+    y: usize,
+    kind: ItemKind,
+}
+
+#[derive(Clone, Copy)]
+enum ItemKind {
+    Heal,
+}
+
 struct Game {
     map: Map,
     player: Entity,
     monsters: Vec<Entity>,
+    items: Vec<Item>,
     kills: u32,
     msg: String,
     vw: usize, // 实际渲染宽度（受终端窗口限制）
@@ -36,8 +48,9 @@ impl Game {
         let (px, py, _, _) = map.rooms[0];
         let (px, py) = (px + 1, py + 1);
 
-        // 怪物：放在每个房间里（第一间除外）
+        // 怪物 + 血瓶：每个房间（第一间除外）放一只怪和一个 +
         let mut monsters = Vec::new();
+        let mut items = Vec::new();
         let mut rng = rand::rng();
         let names = ['g', 'r', 's', 'k'];
         for (i, &(rx, ry, rw, rh)) in map.rooms.iter().enumerate() {
@@ -54,6 +67,22 @@ impl Game {
                 max_hp: 10 + (i as i32) * 4,
                 atk: 3 + (i as i32),
             });
+            // 血瓶放在怪物另一头
+            let hx = if rng.random_range(0..2) == 0 {
+                rx
+            } else {
+                rx + rw - 1
+            };
+            let hy = if rng.random_range(0..2) == 0 {
+                ry
+            } else {
+                ry + rh - 1
+            };
+            items.push(Item {
+                x: hx.min(rx + rw - 1).max(rx),
+                y: hy.min(ry + rh - 1).max(ry),
+                kind: ItemKind::Heal,
+            });
         }
 
         let mut game = Game {
@@ -67,6 +96,7 @@ impl Game {
                 atk: 5,
             },
             monsters,
+            items,
             kills: 0,
             msg: String::from("用 h/j/k/l 或方向键移动，走到怪物身上攻击"),
             vw: vw.min(W),
@@ -77,6 +107,9 @@ impl Game {
     }
 
     fn try_move_player(&mut self, dx: i32, dy: i32) {
+        if self.player.hp <= 0 {
+            return; // 死了不能动，只能 g 重开
+        }
         let nx = self.player.x as i32 + dx;
         let ny = self.player.y as i32 + dy;
         if nx < 0 || ny < 0 || nx >= W as i32 || ny >= H as i32 {
@@ -104,7 +137,24 @@ impl Game {
         if self.map.is_walkable(nx, ny) {
             self.player.x = nx;
             self.player.y = ny;
+            self.pickup();
             self.end_turn();
+        }
+    }
+
+    /// 踩到 + 回血（最多回满）。
+    fn pickup(&mut self) {
+        let (px, py) = (self.player.x, self.player.y);
+        let idx = self.items.iter().position(|it| it.x == px && it.y == py);
+        if let Some(i) = idx {
+            match self.items[i].kind {
+                ItemKind::Heal => {
+                    let before = self.player.hp;
+                    self.player.hp = (self.player.hp + 15).min(self.player.max_hp);
+                    self.msg = format!("喝下血瓶，恢复{}血", self.player.hp - before);
+                }
+            }
+            self.items.remove(i);
         }
     }
 
@@ -177,14 +227,20 @@ impl Game {
         for y in 0..self.vh {
             for x in 0..self.vw {
                 let i = self.map.idx(x, y);
-                let glyph = if let Some(_) = self
+                let glyph = if self.player.x == x && self.player.y == y {
+                    '@'
+                } else if let Some(_) = self
                     .monsters
                     .iter()
                     .find(|m| m.x == x && m.y == y && self.map.visible[i])
                 {
                     self.monsters.iter().find(|m| m.x == x && m.y == y).unwrap().ch
-                } else if self.player.x == x && self.player.y == y {
-                    '@'
+                } else if let Some(_) = self
+                    .items
+                    .iter()
+                    .find(|it| it.x == x && it.y == y && self.map.visible[i])
+                {
+                    '+'
                 } else if !self.map.explored[i] {
                     ' '
                 } else {
@@ -295,6 +351,18 @@ fn regenerate_world(game: &mut Game) {
     }
     game.map = map;
     game.monsters = monsters;
+    game.items = Vec::new();
+    // 每个房间放一个血瓶
+    for (i, &(rx, ry, rw, rh)) in game.map.rooms.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        game.items.push(Item {
+            x: rx + 1 + rng.random_range(0..rw.saturating_sub(2)),
+            y: ry + 1 + rng.random_range(0..rh.saturating_sub(2)),
+            kind: ItemKind::Heal,
+        });
+    }
     game.player.x = px;
     game.player.y = py;
     game.player.hp = game.player.max_hp;
@@ -377,6 +445,36 @@ mod tests {
         assert_eq!(key_delta(KeyCode::Char('u')), (1, -1));
         assert_eq!(key_delta(KeyCode::Char('b')), (-1, 1));
         assert_eq!(key_delta(KeyCode::Char('n')), (1, 1));
+    }
+
+    /// 踩到血瓶回血且上限封顶；死了之后移动被封锁。
+    #[test]
+    fn pickup_heals_and_death_locks() {
+        let mut g = Game::new(60, 25);
+        g.player.hp = 5;
+        // 把一个血瓶挪到玩家脚边
+        let it = g.items.first().unwrap();
+        let (ix, iy) = (it.x, it.y);
+        g.player.x = ix;
+        g.player.y = iy - 1;
+        g.try_move_player(0, 1); // 走到 + 上
+        assert!(g.player.hp > 5, "血瓶没生效");
+        assert!(!g.items.iter().any(|i| i.x == ix && i.y == iy), "血瓶没被拾取");
+
+        // 回血不超过上限
+        g.player.hp = g.player.max_hp - 5;
+        let it2 = g.items.first().unwrap();
+        g.player.x = it2.x;
+        g.player.y = it2.y;
+        g.pickup();
+        assert_eq!(g.player.hp, g.player.max_hp);
+
+        // 死亡封锁
+        g.player.hp = 0;
+        let start = (g.player.x, g.player.y);
+        g.try_move_player(1, 0);
+        g.try_move_player(-1, 0);
+        assert_eq!((g.player.x, g.player.y), start, "死了还能动");
     }
 
     /// render() 里所有换行都带 \r（CRLF），避免 raw mode 下阶梯乱码。
