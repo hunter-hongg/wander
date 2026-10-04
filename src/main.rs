@@ -217,6 +217,21 @@ fn main() -> std::io::Result<()> {
     result
 }
 
+/// 按键 → (dx, dy)。h/j/k/l = 左/下/上/右，y/u/b/n = 四角。
+fn key_delta(code: KeyCode) -> (i32, i32) {
+    match code {
+        KeyCode::Left | KeyCode::Char('h') => (-1, 0),
+        KeyCode::Down | KeyCode::Char('j') => (0, 1),
+        KeyCode::Up | KeyCode::Char('k') => (0, -1),
+        KeyCode::Right | KeyCode::Char('l') => (1, 0),
+        KeyCode::Char('y') => (-1, -1),
+        KeyCode::Char('u') => (1, -1),
+        KeyCode::Char('b') => (-1, 1),
+        KeyCode::Char('n') => (1, 1),
+        _ => (0, 0),
+    }
+}
+
 fn run(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<()> {
     loop {
         // 绘制。render() 已输出 CRLF（raw mode 下 \n 不回车）
@@ -239,15 +254,7 @@ fn run(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<()> {
                     regenerate_world(game);
                     continue;
                 }
-                KeyCode::Left | KeyCode::Char('h') => (0, -1),
-                KeyCode::Down | KeyCode::Char('j') => (1, 0),
-                KeyCode::Up | KeyCode::Char('k') => (-1, 0),
-                KeyCode::Right | KeyCode::Char('l') => (0, 1),
-                KeyCode::Char('y') => (-1, -1),
-                KeyCode::Char('u') => (-1, 1),
-                KeyCode::Char('b') => (1, -1),
-                KeyCode::Char('n') => (1, 1),
-                _ => (0, 0),
+                _ => key_delta(k.code),
             };
             if delta != (0, 0) {
                 game.try_move_player(delta.0, delta.1);
@@ -352,6 +359,24 @@ mod tests {
         // 只要不 panic、坐标仍在界内即可
         assert!(g.player.x < W && g.player.y < H);
         let _ = start;
+    }
+
+    /// h/j/k/l 严格对应 左/下/上/右，斜向键 y/u/b/n 对应四个角。
+    #[test]
+    fn direction_mapping() {
+        use crossterm::event::KeyCode;
+        assert_eq!(key_delta(KeyCode::Char('h')), (-1, 0));
+        assert_eq!(key_delta(KeyCode::Char('j')), (0, 1));
+        assert_eq!(key_delta(KeyCode::Char('k')), (0, -1));
+        assert_eq!(key_delta(KeyCode::Char('l')), (1, 0));
+        assert_eq!(key_delta(KeyCode::Left), (-1, 0));
+        assert_eq!(key_delta(KeyCode::Down), (0, 1));
+        assert_eq!(key_delta(KeyCode::Up), (0, -1));
+        assert_eq!(key_delta(KeyCode::Right), (1, 0));
+        assert_eq!(key_delta(KeyCode::Char('y')), (-1, -1));
+        assert_eq!(key_delta(KeyCode::Char('u')), (1, -1));
+        assert_eq!(key_delta(KeyCode::Char('b')), (-1, 1));
+        assert_eq!(key_delta(KeyCode::Char('n')), (1, 1));
     }
 
     /// render() 里所有换行都带 \r（CRLF），避免 raw mode 下阶梯乱码。
