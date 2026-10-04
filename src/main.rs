@@ -63,9 +63,9 @@ impl Game {
                 x: mx,
                 y: my,
                 ch: names[i % names.len()],
-                hp: 10 + (i as i32) * 4,
-                max_hp: 10 + (i as i32) * 4,
-                atk: 3 + (i as i32),
+                hp: 8 + (i as i32) * 3,
+                max_hp: 8 + (i as i32) * 3,
+                atk: 2 + i / 2,
             });
             // 血瓶放在怪物另一头
             let hx = if rng.random_range(0..2) == 0 {
@@ -91,9 +91,9 @@ impl Game {
                 x: px,
                 y: py,
                 ch: '@',
-                hp: 30,
-                max_hp: 30,
-                atk: 5,
+                hp: 40,
+                max_hp: 40,
+                atk: 8,
             },
             monsters,
             items,
@@ -180,10 +180,14 @@ impl Game {
                 let nx = m.x as i32 + step_x;
                 let ny = m.y as i32 + step_y;
                 if nx == px as i32 && ny == py as i32 {
-                    // 咬玩家
-                    let dmg = (m.atk / 2 + rng.random_range(0..m.atk)).max(1);
-                    self.player.hp -= dmg;
-                    hits.push(format!("{}咬了你{}血（剩余{}）", m.ch, dmg, self.player.hp));
+                    // 咬玩家（25% 落空）
+                    if rng.random_range(0..4) == 0 {
+                        self.msg = format!("{}扑了个空", m.ch);
+                    } else {
+                        let dmg = (m.atk / 2 + rng.random_range(0..m.atk)).max(1);
+                        self.player.hp -= dmg;
+                        hits.push(format!("{}咬了你{}血（剩余{}）", m.ch, dmg, self.player.hp));
+                    }
                 } else if self.map.is_walkable(nx as usize, ny as usize)
                     && !occupied.contains(&(nx as usize, ny as usize))
                     && !(nx as usize == px && ny as usize == py)
@@ -308,6 +312,12 @@ fn run(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<()> {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('g') => {
                     regenerate_world(game);
+                    continue;
+                }
+                KeyCode::Char(' ') => {
+                    // 原地待机：让怪先动
+                    game.msg = "你原地待机。".to_string();
+                    game.end_turn();
                     continue;
                 }
                 _ => key_delta(k.code),
