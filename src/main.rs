@@ -25,10 +25,12 @@ struct Game {
     monsters: Vec<Entity>,
     kills: u32,
     msg: String,
+    vw: usize, // 实际渲染宽度（受终端窗口限制）
+    vh: usize, // 实际渲染高度（受终端窗口限制）
 }
 
 impl Game {
-    fn new() -> Self {
+    fn new(vw: usize, vh: usize) -> Self {
         let mut map = Map::new();
         map.generate(None);
         let (px, py, _, _) = map.rooms[0];
@@ -67,6 +69,8 @@ impl Game {
             monsters,
             kills: 0,
             msg: String::from("用 h/j/k/l 或方向键移动，走到怪物身上攻击"),
+            vw: vw.min(W),
+            vh: (vh.saturating_sub(3)).min(H),
         };
         game.map.recompute_vision(game.player.x, game.player.y, 8);
         game
@@ -165,13 +169,13 @@ impl Game {
     fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "WANDER  生命 {} / {}   击杀 {}\n",
+            "WANDER  生命 {} / {}   击杀 {}\r\n",
             self.player.hp.max(0),
             self.player.max_hp,
             self.kills
         ));
-        for y in 0..H {
-            for x in 0..W {
+        for y in 0..self.vh {
+            for x in 0..self.vw {
                 let i = self.map.idx(x, y);
                 let glyph = if let Some(_) = self
                     .monsters
@@ -191,9 +195,9 @@ impl Game {
                 };
                 out.push(glyph);
             }
-            out.push('\n');
+            out.push_str("\r\n");
         }
-        out.push_str(&format!("{}\nq 退出\ng 生成新地牢/+1 层  ", self.msg));
+        out.push_str(&format!("{}\r\nq 退出  g 生成新地牢/+1 层\r\n", self.msg));
         out
     }
 }
@@ -203,7 +207,9 @@ fn main() -> std::io::Result<()> {
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
 
-    let mut game = Game::new();
+    let (cols, rows) = crossterm::terminal::size()?;
+    let (vw, vh) = (cols as usize, rows as usize);
+    let mut game = Game::new(vw.max(40), vh.max(7));
     let result = run(&mut game, &mut stdout);
 
     disable_raw_mode()?;
@@ -213,7 +219,7 @@ fn main() -> std::io::Result<()> {
 
 fn run(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<()> {
     loop {
-        // 绘制
+        // 绘制。render() 已输出 CRLF（raw mode 下 \n 不回车）
         execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
         write!(stdout, "{}", game.render())?;
         stdout.flush()?;
@@ -337,7 +343,7 @@ mod tests {
     /// 玩家朝墙/边界移动不 panic，朝空地移动位置更新，朝怪物移动则攻击。
     #[test]
     fn movement_does_not_panic() {
-        let mut g = Game::new();
+        let mut g = Game::new(60, 25);
         let start = (g.player.x, g.player.y);
         g.try_move_player(-1, 0);
         g.try_move_player(1, 0);
@@ -348,10 +354,21 @@ mod tests {
         let _ = start;
     }
 
+    /// render() 里所有换行都带 \r（CRLF），避免 raw mode 下阶梯乱码。
+    #[test]
+    fn render_uses_crlf() {
+        let g = Game::new(60, 25);
+        let s = g.render();
+        let bare = s.match_indices('\n').filter(|(i, _)| {
+            i == &0 || s.as_bytes()[i - 1] != b'\r'
+        });
+        assert_eq!(bare.count(), 0, "render 存在裸 \\n");
+    }
+
     /// 新地牢重生后玩家满血且回到房间0。
     #[test]
     fn regenerate_resets() {
-        let mut g = Game::new();
+        let mut g = Game::new(60, 25);
         g.player.hp = 1;
         g.try_move_player(0, 1);
         regenerate_world(&mut g);
