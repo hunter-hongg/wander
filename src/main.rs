@@ -700,7 +700,7 @@ impl Game {
         self.player.y = ry + 1;
         self.boss_down = false;
         self.msg = format!(
-            "你下到第{}/{}层：怪物更强了，小怪更少、射手更多。杀掉深处的守护者继续向下",
+            "你下到第{}/{}层：怪物更强了，骷髅更多、射手更少。杀掉深处的守护者继续向下",
             self.floor, MAX_FLOOR
         );
         self.map.recompute_vision(self.player.x, self.player.y, 8);
@@ -1104,8 +1104,8 @@ fn try_move(
     }
 }
 
-/// 按房间序号和层数生成怪物：前几间放近战小怪，中间几间放射手，最后一间是本层守护者。
-/// 1 层 = 4 小怪 + 3 射手；每下一层小怪少 1、射手多 1；5 层没有近战小怪。
+/// 按房间序号和层数生成怪物：前几间放近战小怪，后面放射手，最后一间是本层守护者。
+/// 1-2 层 = 4/3 个小怪 + 剩余射手（3/4）；3-5 层近战怪全是骷髅（5/6/7 只递增），射手 3/4/5 只也递增。
 /// 怪物血/攻逐层上涨（见 floor_hp 与攻击公式）。房间 0 是玩家出生点，不放怪。
 fn populate(floor: u8, map: &Map) -> (Vec<Entity>, Vec<Item>) {
     use rand::seq::SliceRandom;
@@ -1115,33 +1115,58 @@ fn populate(floor: u8, map: &Map) -> (Vec<Entity>, Vec<Item>) {
     let n = map.rooms.len();
     let boss_room = n - 1;
     let f = floor as i32;
-    // 近战小怪数量 4,3,2,1,0；其余 7 间全给射手（3,4,5,6,7）
-    let melee_count = 4usize.saturating_sub(floor as usize - 1);
+    // 1-2 层：小怪 4/3 只 + 剩余射手（3/4）；
+    // 3-5 层：近战怪全是骷髅 5/6/7 只递增，射手 3/4/5 只递增，每间房可塞多只
+    let (melee_count, ranged_count) = if floor <= 2 {
+        let m = 4usize.saturating_sub(floor as usize - 1);
+        (m, boss_room - 1 - m)
+    } else {
+        (2 + floor as usize, floor as usize) // 3层骷髅5射手3；4层6/4；5层7/5
+    };
+    // 已占用格子（避免两只怪生在同一格）：从非出生房的所有可走格里随机挑
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     for i in 1..boss_room {
         let (rx, ry, rw, rh) = map.rooms[i];
-        let mx = rx + 1 + rng.random_range(0..rw.saturating_sub(2));
-        let my = ry + 1 + rng.random_range(0..rh.saturating_sub(2));
+        for x in (rx + 1)..(rx + rw - 1) {
+            for y in (ry + 1)..(ry + rh - 1) {
+                if map.is_walkable(x, y) {
+                    candidates.push((x, y));
+                }
+            }
+        }
+    }
+    candidates.shuffle(&mut rng);
+    let total = melee_count + ranged_count;
+    for i in 0..total {
+        let (mx, my) = candidates.pop().expect("可走格不够放怪，地图生成有问题");
         let (name, ch, hp, atk, sight, behavior): (&str, char, i32, i32, usize, Behavior) =
-            if i <= melee_count {
-                let t = (i - 1) % 4; // 小怪种类循环：哥布林/巨鼠/蜘蛛/骷髅
-                let name = ["哥布林", "巨鼠", "蜘蛛", SKELETON][t];
+            if i < melee_count {
+                // 3-5 层近战怪全是骷髅（除守护者外的近战皆骷髅）；1-2 层循环四种小怪
+                let t = i % 4;
+                let name = if floor >= 3 {
+                    SKELETON
+                } else {
+                    ["哥布林", "巨鼠", "蜘蛛", SKELETON][t]
+                };
+                let ch = if floor >= 3 { 'k' } else { ['g', 'r', 's', 'k'][t] };
                 let skeleton_bonus = if name == SKELETON { SKELETON_ATK_BONUS } else { 0 };
                 let base_atk = 3 + i as i32 + 2 * (f - 1) + skeleton_bonus;
                 let atk = if name == SKELETON { base_atk.min(MAX_SKELETON_ATK) } else { base_atk };
                 (
                     name,
-                    ['g', 'r', 's', 'k'][t],
-                    floor_hp(10 + (i as i32) * 4, f),
+                    ch,
+                    floor_hp(10 + i as i32 * 4, f),
                     atk,
                     8,
                     Behavior::Melee,
                 )
             } else {
+                let j = i - melee_count;
                 (
                     "暗影射手",
                     'o',
-                    floor_hp(12 + (i as i32) * 3, f),
-                    2 + (i as i32) / 2 + 2 * (f - 1),
+                    floor_hp(12 + j as i32 * 3, f),
+                    2 + j as i32 / 2 + 2 * (f - 1),
                     12,
                     Behavior::Ranged,
                 )
@@ -1771,25 +1796,36 @@ mod tests {
                     .iter()
                     .filter(|m| matches!(m.behavior, Behavior::Ranged))
                     .count();
-                assert_eq!(
-                    melee,
-                    4usize.saturating_sub(floor as usize - 1),
-                    "第 {floor} 层小怪数量不对"
-                );
-                assert_eq!(
-                    ranged,
-                    3 + (floor as usize - 1),
-                    "第 {floor} 层射手数量不对"
-                );
+                let expected_melee = if floor <= 2 {
+                    4usize.saturating_sub(floor as usize - 1)
+                } else {
+                    2 + floor as usize
+                };
+                let expected_ranged = if floor <= 2 {
+                    3 + (floor as usize - 1)
+                } else {
+                    floor as usize
+                };
+                assert_eq!(melee, expected_melee, "第 {floor} 层小怪数量不对");
+                assert_eq!(ranged, expected_ranged, "第 {floor} 层射手数量不对");
+                // 3 层起近战小怪（非 boss）必须全是骷髅
+                if floor >= 3 {
+                    assert!(monsters
+                        .iter()
+                        .filter(|m| !m.is_boss && matches!(m.behavior, Behavior::Melee))
+                        .all(|m| m.name == SKELETON));
+                }
                 // boss 只能有一个，且是近战大血牛
                 let bosses: Vec<_> = monsters.iter().filter(|m| m.is_boss).collect();
                 assert_eq!(bosses.len(), 1, "第 {floor} 层 boss 数量不对");
                 assert!(matches!(bosses[0].behavior, Behavior::Melee));
                 assert!(bosses[0].hp >= 50, "第 {floor} 层 boss 血量太低");
-                // 远程射手视野比近战远，用来在房间另一头开火
+                // 远程射手视野比近战远，用来在房间另一头开火（5 层可能一名射手都没有）
                 let ranged_m = monsters.iter().find(|m| matches!(m.behavior, Behavior::Ranged));
-                assert!(ranged_m.is_some(), "没有远程怪");
-                assert!(ranged_m.unwrap().sight > 8);
+                if floor < 5 {
+                    assert!(ranged_m.is_some(), "没有远程怪");
+                    assert!(ranged_m.unwrap().sight > 8);
+                }
             }
         }
     }
@@ -1922,8 +1958,23 @@ mod tests {
             let (ms, _) = populate(f, &map);
             let melee = ms.iter().filter(|m| !m.is_boss && m.behavior == Behavior::Melee).count();
             let ranged = ms.iter().filter(|m| m.behavior == Behavior::Ranged).count();
-            assert_eq!(melee, 4usize.saturating_sub(f as usize - 1), "第 {f} 层小怪数量");
-            assert_eq!(ranged, 3 + (f as usize - 1), "第 {f} 层射手数量");
+            let expected_melee = if f <= 2 {
+                4usize.saturating_sub(f as usize - 1)
+            } else {
+                2 + f as usize
+            };
+            assert_eq!(melee, expected_melee, "第 {f} 层小怪数量");
+            assert_eq!(
+                ranged,
+                if f <= 2 { 3 + (f as usize - 1) } else { f as usize },
+                "第 {f} 层射手数量"
+            );
+            if f >= 3 {
+                assert!(ms
+                    .iter()
+                    .filter(|m| !m.is_boss && m.behavior == Behavior::Melee)
+                    .all(|m| m.name == SKELETON));
+            }
         }
     }
 
@@ -2051,8 +2102,8 @@ mod tests {
         map.generate(None);
         let (monsters, _) = populate(1, &map);
         let sk = monsters.iter().find(|m| m.name == SKELETON).expect("第 1 层该有骷髅");
-        let i = monsters.iter().position(|m| m.name == SKELETON).unwrap() as i32 + 1;
-        assert_eq!(sk.atk, 3 + i + SKELETON_ATK_BONUS);
+        // 1 层骷髅是第 4 只近战（生成下标 3），atk = 3 + 3 + 加成
+        assert_eq!(sk.atk, 3 + 3 + SKELETON_ATK_BONUS);
     }
 
     /// 活着的时候按 g 不能重开；死了或通关了才可以（回商店开新局）。
