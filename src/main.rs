@@ -288,8 +288,8 @@ impl Game {
                 "地牢共 5 层，越深越难。h/j/k/l 移动，撞上怪物即攻击。杀掉本层守护者 D 后按 d 下楼或 g 结算。+ 血瓶 / M 武林秘籍 / Q 蕴气丹 / S 盾牌"
             ),
             vw: vw.min(W),
-            // 3 行头部 + 2 行成就（基础/高级）+ 地图 + 1 行消息 + 1 行按键提示
-            vh: (vh.saturating_sub(6)).min(H),
+            // 5 行头部（标题/物品/工具/基础成就/高级成就）+ 地图 + 1 行消息 + 1 行按键提示
+            vh: (vh.saturating_sub(7)).min(H),
         };
         game.map.recompute_vision(game.player.x, game.player.y, 8);
         game
@@ -792,47 +792,36 @@ impl Game {
             self.render_settlement(&mut out, COLOR_GOLD, COLOR_RESET);
             return out;
         }
-
+        // 第一行：标题 + HP
         out.push_str(&format!(
-            "{}WANDER  生命 {} / {}   攻击 {}   血瓶 {}   秘籍 {}   蕴气丹 {}{}\r\n",
+            "{}WANDER  生命 {} / {}{}\r\n",
             COLOR_PLAYER,
             self.player.hp.max(0),
             self.player.max_hp,
-            self.player.atk,
+            COLOR_RESET
+        ));
+        // 第二行：物品栏
+        out.push_str(&format!(
+            "物品：血瓶 x{}  秘籍 x{}  蕴气丹 x{}  盾牌存量 x{}/{}  积分 {}\r\n",
             self.potions,
             self.manuals,
             self.qi_pills,
-            COLOR_RESET
-        ));
-        let lucky_tag = if self.lucky { "  幸运符" } else { "" };
-        let shield_tag = if self.shield > 0 {
-            format!("  盾牌 {}/{}", self.shield, SHIELD_DURABILITY)
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "{}第 {}/{} 层   击杀 {}   积分 {}{}{}{}\r\n",
-            COLOR_PLAYER,
-            self.floor,
-            MAX_FLOOR,
-            self.kills,
-            self.credits,
-            lucky_tag,
-            shield_tag,
-            COLOR_RESET
-        ));
-        out.push_str(&format!(
-            "背包：血瓶 x{}（按1回血{}/{}）｜武林秘籍 x{}（按2攻击翻倍）｜蕴气丹 x{}（按3上限+{}，耗{}血）｜盾牌存量 x{}/{}（碎盾自动换上）\r\n",
-            self.potions,
-            HEAL_AMOUNT,
-            self.potions * HEAL_AMOUNT as usize,
-            self.manuals,
-            self.qi_pills,
-            QI_MAX_HP_BONUS,
-            QI_HP_COST,
             self.shield_stock.len(),
             SHIELD_STOCK_MAX,
+            self.credits,
         ));
+        // 第三行：工具栏（盾牌及耐久）
+        if self.shield > 0 {
+            out.push_str(&format!(
+                "{}盾牌 {}/{}{}\r\n",
+                COLOR_ITEM_SHIELD,
+                self.shield,
+                SHIELD_DURABILITY,
+                COLOR_RESET
+            ));
+        } else {
+            out.push_str("盾牌：无\r\n");
+        }
         // 成就两行：基础/高级分开展示（不用普通消息栏 msg）；没达成过显示“无”，达成过金色列出
         let ach_body = |v: &[&'static str]| if v.is_empty() { "无".to_string() } else { v.join(" | ") };
         let basic = self.unlocked_achievements(&BASIC_ACHIEVEMENTS);
@@ -2268,14 +2257,14 @@ mod tests {
         assert_eq!(fresh.player.hp, BASE_MAX_HP);
     }
 
-    /// 背包行得被渲染出来，操作提示也得带上 2/3 两个新键。
+    /// 物品行得被渲染出来，操作提示也得带上 2/3 两个新键。
     #[test]
     fn render_shows_new_backpack_and_keys() {
         let g = Game::new(60, 25);
         let s = g.render();
-        assert!(s.contains("背包"), "没有渲染背包行");
-        assert!(s.contains("武林秘籍"), "背包行没有秘籍");
-        assert!(s.contains("蕴气丹"), "背包行没有蕴气丹");
+        assert!(s.contains("物品"), "没有渲染物品行");
+        assert!(s.contains("秘籍"), "物品行没有秘籍");
+        assert!(s.contains("蕴气丹"), "物品行没有蕴气丹");
         assert!(s.contains("2 秘籍"), "操作提示没有 2 键");
         assert!(s.contains("3 蕴气丹"), "操作提示没有 3 键");
     }
