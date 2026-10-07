@@ -62,8 +62,8 @@ const LUCKY_QUAD_CHANCE: u32 = 25;
 /// 骷髅掉落骷髅刀的概率（%）；带幸运符时提升至 80%。
 const BLADE_DROP_PERCENT: u32 = 20;
 const BLADE_LUCKY_DROP_PERCENT: u32 = 80;
-/// 骷髅刀效果：装备时攻击固定 +3。
-const BLADE_ATK_BONUS: i32 = 3;
+/// 骷髅刀效果：装备时攻击固定 +6。
+const BLADE_ATK_BONUS: i32 = 6;
 /// 结算时一把骷髅刀按多少积分结算（进基础分，随层数倍率与折半）。
 const BLADE_SCORE: u32 = 500;
 /// 地牢共几层：杀掉本层守护者即可下楼，清完第 5 层才通关；结算倍率 = 当前层。
@@ -386,7 +386,7 @@ impl Game {
                         } else {
                             self.blade = true;
                             self.blade_equipped = true;
-                            self.msg.push_str("（骷髅掉落了骷髅刀，自动收入背包，攻击 +3）");
+                            self.msg.push_str("（骷髅掉落了骷髅刀，自动收入背包，攻击 +6）");
                         }
                     }
                 }
@@ -581,7 +581,7 @@ impl Game {
         }
     }
 
-    /// 装备骷髅刀：攻击固定 +3，不消耗回合。
+    /// 装备骷髅刀：攻击固定 +6，不消耗回合。
     fn equip_blade(&mut self) {
         if !self.blade {
             self.msg = "背包里没有骷髅刀".to_string();
@@ -593,7 +593,7 @@ impl Game {
         }
         self.blade_equipped = true;
         self.weapon_menu = false;
-        self.msg = format!("装备骷髅刀！攻击力 {} → {}（+3）", self.player.atk, self.attack_power());
+        self.msg = format!("装备骷髅刀！攻击力 {} → {}（+6）", self.player.atk, self.attack_power());
     }
 
     /// 卸下骷髅刀：换回空手，不消耗回合。
@@ -998,7 +998,7 @@ impl Game {
             if !eq { "(当前)" } else { "" }
         ));
         out.push_str(&format!(
-            "{}{} [2] 骷髅刀 (+3 攻击) {}{}\r\n",
+            "{}{} [2] 骷髅刀 (+6 攻击) {}{}\r\n",
             if has_blade { blade_color } else { "\x1b[90m" }, // 灰色表示没有
             check(eq && has_blade),
             if eq && has_blade { "(当前)" } else { if !has_blade { "(未拾取)" } else { "" } },
@@ -3708,9 +3708,9 @@ mod tests {
         assert!(dropped_but_rejected, "背包里已有骷髅刀时，新掉落该被拒绝");
     }
 
-    /// 骷髅刀效果：装备时攻击固定 +3，卸下后恢复基础攻击。
+    /// 骷髅刀效果：装备时攻击固定 +6，卸下后恢复基础攻击。
     #[test]
-    fn blade_bonus_is_fixed_plus_three() {
+    fn blade_bonus_is_fixed() {
         let mut g = Game::new(60, 25);
         g.blade = true;
         g.blade_equipped = true;
@@ -3719,7 +3719,7 @@ mod tests {
         g.blade_equipped = false;
         assert_eq!(g.attack_power(), BASE_ATK, "卸下骷髅刀攻击没恢复");
 
-        // 与秘籍叠加：8 → 16（秘籍）→ 19（骷髅刀）
+        // 与秘籍叠加：8 → 16（秘籍）→ 22（骷髅刀）
         g.player.atk = 2 * BASE_ATK;
         g.blade_equipped = true;
         assert_eq!(g.attack_power(), 2 * BASE_ATK + BLADE_ATK_BONUS, "与秘籍叠加不对");
