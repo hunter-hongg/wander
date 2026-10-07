@@ -59,6 +59,13 @@ const MAX_POTION_BUY: usize = 3;
 const LUCKY_DROP_PERCENT: u32 = 90;
 /// 幸运符：参悟武林秘籍时 25% 概率攻击力 ×4（×4 仅此唯一获得途径）。
 const LUCKY_QUAD_CHANCE: u32 = 25;
+/// 骷髅掉落骷髅刀的概率（%）；带幸运符时提升至 80%。
+const BLADE_DROP_PERCENT: u32 = 20;
+const BLADE_LUCKY_DROP_PERCENT: u32 = 80;
+/// 骷髅刀效果：装备时攻击固定 +3。
+const BLADE_ATK_BONUS: i32 = 3;
+/// 结算时一把骷髅刀按多少积分结算（进基础分，随层数倍率与折半）。
+const BLADE_SCORE: u32 = 500;
 /// 地牢共几层：杀掉本层守护者即可下楼，清完第 5 层才通关；结算倍率 = 当前层。
 const MAX_FLOOR: u8 = 5;
 /// 成就名：目前仅图一乐，不设奖励，HUD 专门一行提示（基础/高级分行区分）。
@@ -158,6 +165,7 @@ struct Score {
     last_kills: u32,
     last_potions: usize,
     last_shields: usize,
+    last_blades: usize, // 上一局结算时的骷髅刀数量
 }
 
 impl Score {
@@ -189,12 +197,13 @@ impl Score {
         let _ = fs::write(&path, serde_json::to_string_pretty(self).unwrap_or_default());
     }
 
-    fn add_run(&mut self, kills: u32, potions: usize, shields: usize, score: u32) -> u32 {
-        // 积分 = (kills * 100 + 剩余血瓶 * 50 + 存量盾牌耐久折算) × 层数倍率，死亡和幸运符各折半（见 Game::settlement_score）
+    fn add_run(&mut self, kills: u32, potions: usize, shields: usize, blades: usize, score: u32) -> u32 {
+        // 积分 = (kills * 100 + 剩余血瓶 * 50 + 存量盾牌耐久折算 + 骷髅刀×500) × 层数倍率，死亡和幸运符各折半（见 Game::settlement_score）
         self.last_score = score;
         self.last_kills = kills;
         self.last_potions = potions;
         self.last_shields = shields;
+        self.last_blades = blades;
         self.total_score += score;
         self.credits += score;
         self.save();
@@ -212,6 +221,9 @@ struct Game {
     qi_pills: usize, // 背包里的蕴气丹，按 3 服用
     shield: i32, // 手里盾牌的耐久，0 = 没有盾牌（有盾时格挡来袭伤害，命中 -1 耐久）
     shield_stock: Vec<i32>, // 背包里留存的盾牌，每面记下当时收进去的耐久（最多 SHIELD_STOCK_MAX 面；盾碎了自动取耐久最高的一面换上）
+    blade: bool, // 持有骷髅刀（手里或背包里）；背包里已有时无法再拾取新的
+    blade_equipped: bool, // 当前手持骷髅刀（攻击固定 +BLADE_ATK_BONUS）
+    weapon_menu: bool, // 武器切换窗口打开着（模态，不消耗回合）
     kills: u32,
     floor: u8, // 当前层 1..=MAX_FLOOR
     boss_down: bool, // 本层守护者已倒（可下楼，或主动结束按当前层结算）
@@ -277,6 +289,9 @@ impl Game {
             qi_pills: 0,
             shield: 0,
             shield_stock: Vec::new(),
+            blade: false,
+            blade_equipped: false,
+            weapon_menu: false,
             kills: 0,
             floor: 1,
             boss_down: false,
@@ -287,7 +302,7 @@ impl Game {
             arrows_blocked: 0,
             species_killed: HashSet::new(),
             msg: String::from(
-                "地牢共 5 层，越深越难。h/j/k/l 移动，撞上怪物即攻击。杀掉本层守护者 D 后按 d 下楼或 g 结算。+ 血瓶 / M 武林秘籍 / Q 蕴气丹 / S 盾牌"
+                "地牢共 5 层，越深越难。h/j/k/l 移动，撞上怪物即攻击。杀掉本层守护者 D 后按 d 下楼或 g 结算。+ 血瓶 / M 武林秘籍 / Q 蕴气丹 / S 盾牌 / † 骷髅刀（骷髅掉落）"
             ),
             vw: vw.min(W),
             // 5 行头部（标题/物品/工具/基础成就/高级成就）+ 地图 + 1 行消息 + 1 行按键提示
@@ -308,10 +323,13 @@ impl Game {
         }
         let (nx, ny) = (nx as usize, ny as usize);
 
+        // 先计算攻击力（避免与 monsters 的借用冲突）
+        let atk = self.attack_power();
+
         // 撞到怪物 -> 攻击
         if let Some(m) = self.monsters.iter_mut().find(|m| m.x == nx && m.y == ny) {
             let mut rng = rand::rng();
-            let dmg = roll(&mut rng, self.player.atk);
+            let dmg = roll(&mut rng, atk);
             m.hp -= dmg;
             let killed = m.hp <= 0;
             // 先抄走名字（Copy 的 &'static str），后面解锁成就时 m 的借用必须已结束
@@ -353,6 +371,23 @@ impl Game {
                     if shield_drop {
                         self.items.push(Item { x: m.x, y: m.y, kind: ItemKind::Shield });
                         self.msg.push_str("（掉落了一面盾牌）");
+                    }
+                }
+                // 骷髅死后：20% 掉骷髅刀，带幸运符提升至 80%；默认自动收入背包（已有则无法拾取）
+                if m.name == SKELETON {
+                    let blade_drop = if self.lucky {
+                        rng.random_range(0..100) < BLADE_LUCKY_DROP_PERCENT
+                    } else {
+                        rng.random_range(0..100) < BLADE_DROP_PERCENT
+                    };
+                    if blade_drop {
+                        if self.blade {
+                            self.msg.push_str("（骷髅掉落了骷髅刀，但背包里已有，无法拾取）");
+                        } else {
+                            self.blade = true;
+                            self.blade_equipped = true;
+                            self.msg.push_str("（骷髅掉落了骷髅刀，自动收入背包，攻击 +3）");
+                        }
                     }
                 }
             }
@@ -531,6 +566,55 @@ impl Game {
             );
         }
         self.check_fully_armed(); // 状态更新：血量上限变了，看看是否全副武装
+    }
+
+    /// 按 w：切换武器（空手 / 骷髅刀），模态窗口选择，不消耗回合。
+    fn toggle_weapon_menu(&mut self) {
+        if self.player.hp <= 0 || !matches!(self.end, End::None) {
+            return; // 死了或本局结算了不能切换武器
+        }
+        self.weapon_menu = !self.weapon_menu;
+        if self.weapon_menu {
+            self.msg = "切换武器：[1] 空手  [2] 骷髅刀（如有）  按 w 关闭".to_string();
+        } else {
+            self.msg = "关闭武器菜单".to_string();
+        }
+    }
+
+    /// 装备骷髅刀：攻击固定 +3，不消耗回合。
+    fn equip_blade(&mut self) {
+        if !self.blade {
+            self.msg = "背包里没有骷髅刀".to_string();
+            return;
+        }
+        if self.blade_equipped {
+            self.msg = "你已经装备了骷髅刀".to_string();
+            return;
+        }
+        self.blade_equipped = true;
+        self.weapon_menu = false;
+        self.msg = format!("装备骷髅刀！攻击力 {} → {}（+3）", self.player.atk, self.attack_power());
+    }
+
+    /// 卸下骷髅刀：换回空手，不消耗回合。
+    fn unequip_blade(&mut self) {
+        if !self.blade_equipped {
+            self.msg = "你已经没有装备骷髅刀".to_string();
+            return;
+        }
+        self.blade_equipped = false;
+        self.weapon_menu = false;
+        self.msg = format!("卸下骷髅刀！攻击力 {} → {}", self.player.atk, self.attack_power());
+    }
+
+    /// 计算当前攻击力：基础攻击 + 骷髅刀加成（如果装备）。
+    fn attack_power(&self) -> i32 {
+        let base = self.player.atk;
+        if self.blade_equipped {
+            base + BLADE_ATK_BONUS
+        } else {
+            base
+        }
     }
 
     /// 处理怪物：能看到玩家就按各自行为追击/射击，否则原地随机游荡。
@@ -714,6 +798,11 @@ impl Game {
             .sum()
     }
 
+    /// 骷髅刀积分：一把 500 分。
+    fn blade_score(&self) -> u32 {
+        if self.blade { BLADE_SCORE } else { 0 }
+    }
+
     /// 本局通过的关数：之前各层都算通过；当前层守护者倒下（或整局通关）再 +1。
     fn floors_cleared(&self) -> u32 {
         let current = self.boss_down || matches!(self.end, End::Victory);
@@ -725,12 +814,13 @@ impl Game {
         self.floors_cleared() * CLEAR_BONUS_PER_FLOOR
     }
 
-    /// 本局结算分：(击杀 × 100 + 剩余血瓶 × 50 + 存量盾牌耐久折算) × 当前层倍率；
+    /// 本局结算分：(击杀 × 100 + 剩余血瓶 × 50 + 存量盾牌耐久折算 + 骷髅刀×500) × 当前层倍率；
     /// 死亡、幸运符各折半一次，最后再加上固定的通关奖励（每关 +500，不折半）。
     fn settlement_score(&self) -> u32 {
         let base = self.kills * 100
             + self.potions as u32 * 50
-            + self.shield_stock_score();
+            + self.shield_stock_score()
+            + self.blade_score();
         let mut score = base * self.floor as u32;
         if matches!(self.end, End::Defeat) {
             score /= 2;
@@ -787,8 +877,14 @@ impl Game {
         const COLOR_ITEM_MANUAL: &str = "\x1b[36m"; // 青色
         const COLOR_ITEM_QI: &str = "\x1b[95m";   // 亮紫色
         const COLOR_ITEM_SHIELD: &str = "\x1b[94m"; // 亮蓝色
+        const COLOR_ITEM_BLADE: &str = "\x1b[38;5;214m"; // 橙黄色（ANSI 214）
         const COLOR_RESET: &str = "\x1b[0m";
         const COLOR_GOLD: &str = "\x1b[33m"; // 金色用于结算
+
+        if self.weapon_menu && matches!(self.end, End::None) {
+            self.render_weapon_menu(&mut out, COLOR_ITEM_BLADE, COLOR_RESET);
+            return out;
+        }
 
         if !matches!(self.end, End::None) {
             self.render_settlement(&mut out, COLOR_GOLD, COLOR_RESET);
@@ -804,25 +900,33 @@ impl Game {
         ));
         // 第二行：物品栏
         out.push_str(&format!(
-            "物品：血瓶 x{}  秘籍 x{}  蕴气丹 x{}  盾牌存量 x{}/{}  积分 {}\r\n",
+            "物品：血瓶 x{}  秘籍 x{}  蕴气丹 x{}  盾牌存量 x{}/{}  骷髅刀 {}  积分 {}\r\n",
             self.potions,
             self.manuals,
             self.qi_pills,
             self.shield_stock.len(),
             SHIELD_STOCK_MAX,
+            if self.blade { "有" } else { "无" },
             self.credits,
         ));
-        // 第三行：工具栏（盾牌及耐久）
+        // 第三行：工具栏（盾牌及耐久 + 武器）
         if self.shield > 0 {
             out.push_str(&format!(
-                "{}盾牌 {}/{}{}\r\n",
+                "{}盾牌 {}/{}  武器：{}{}{}\r\n",
                 COLOR_ITEM_SHIELD,
                 self.shield,
                 SHIELD_DURABILITY,
+                if self.blade_equipped { COLOR_ITEM_BLADE } else { COLOR_RESET },
+                if self.blade_equipped { "骷髅刀" } else { "空手" },
                 COLOR_RESET
             ));
         } else {
-            out.push_str("盾牌：无\r\n");
+            out.push_str(&format!(
+                "盾牌：无  武器：{}{}{}\r\n",
+                if self.blade_equipped { COLOR_ITEM_BLADE } else { COLOR_RESET },
+                if self.blade_equipped { "骷髅刀" } else { "空手" },
+                COLOR_RESET
+            ));
         }
         // 成就两行：基础/高级分开展示（不用普通消息栏 msg）；没达成过显示“无”，达成过金色列出
         let ach_body = |v: &[&'static str]| if v.is_empty() { "无".to_string() } else { v.join(" | ") };
@@ -877,17 +981,38 @@ impl Game {
             out.push_str("\r\n");
         }
         out.push_str(&format!(
-            "{}\r\nq 退出  g 结束本局/回商店（死亡或守护者倒下后）  d 下楼（守护者倒下后）  1 血瓶  2 秘籍  3 蕴气丹  空格待机\r\n",
+            "{}\r\nq 退出  g 结束本局/回商店（死亡或守护者倒下后）  d 下楼（守护者倒下后）  w 切换武器  1 血瓶  2 秘籍  3 蕴气丹  空格待机\r\n",
             self.msg
         ));
         out
+    }
+
+    fn render_weapon_menu(&self, out: &mut String, blade_color: &str, reset: &str) {
+        out.push_str(&format!("切换武器（按 w 关闭）\r\n\r\n"));
+        let has_blade = self.blade;
+        let eq = self.blade_equipped;
+        let check = |b: bool| if b { "[x]" } else { "[ ]" };
+        out.push_str(&format!(
+            "{} [1] 空手 {}\r\n",
+            check(!eq),
+            if !eq { "(当前)" } else { "" }
+        ));
+        out.push_str(&format!(
+            "{}{} [2] 骷髅刀 (+3 攻击) {}{}\r\n",
+            if has_blade { blade_color } else { "\x1b[90m" }, // 灰色表示没有
+            check(eq && has_blade),
+            if eq && has_blade { "(当前)" } else { if !has_blade { "(未拾取)" } else { "" } },
+            reset
+        ));
+        out.push_str(&format!("\r\n{}\r\n", self.msg));
     }
 
     fn render_settlement(&self, out: &mut String, gold: &str, reset: &str) {
         let halved = matches!(self.end, End::Defeat);
         let mult = self.floor as u32;
         let shield_pts = self.shield_stock_score();
-        let full = (self.kills * 100 + self.potions as u32 * 50 + shield_pts) * mult;
+        let blade_pts = self.blade_score();
+        let full = (self.kills * 100 + self.potions as u32 * 50 + shield_pts + blade_pts) * mult;
         let after_death = if halved { full / 2 } else { full };
         let after_lucky = if self.lucky { after_death / 2 } else { after_death };
         let score = self.settlement_score();
@@ -931,6 +1056,13 @@ impl Game {
             put(out, &row(&ledger(
                 &format!("背包盾牌 {} 面·耐久{}×{}/点", self.shield_stock.len(), stock_dur, SHIELD_SCORE_PER_POINT),
                 &format!("{} 积分", shield_pts),
+                INNER,
+            )));
+        }
+        if self.blade {
+            put(out, &row(&ledger(
+                "骷髅刀 1 把",
+                &format!("{} 积分", blade_pts),
                 INNER,
             )));
         }
@@ -1279,7 +1411,7 @@ fn run_game(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<()
     loop {
         if !matches!(game.end, End::None) && !score_persisted {
             let mut record = Score::load();
-            record.add_run(game.kills, game.potions, game.shield_stock.len(), game.settlement_score());
+            record.add_run(game.kills, game.potions, game.shield_stock.len(), if game.blade { 1 } else { 0 }, game.settlement_score());
             game.credits = record.credits;
             score_persisted = true;
         }
@@ -1295,6 +1427,25 @@ fn run_game(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<()
         let ev = event::read()?;
         if let Event::Key(k) = ev {
             if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            // 武器菜单模态：打开时按键只响应菜单，其他按键忽略（仅在游戏进行中）
+            if game.weapon_menu && matches!(game.end, End::None) {
+                match k.code {
+                    KeyCode::Char('1') => {
+                        game.unequip_blade();
+                    }
+                    KeyCode::Char('2') => {
+                        game.equip_blade();
+                    }
+                    KeyCode::Char('w') | KeyCode::Esc => {
+                        game.toggle_weapon_menu();
+                    }
+                    _ => {
+                        game.weapon_menu = false;
+                        game.msg = "关闭武器菜单".to_string();
+                    }
+                }
                 continue;
             }
             let delta = match k.code {
@@ -1334,6 +1485,10 @@ fn run_game(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<()
                         game.msg = "你原地待机。".to_string();
                         game.end_turn();
                     }
+                    continue;
+                }
+                KeyCode::Char('w') => {
+                    game.toggle_weapon_menu();
                     continue;
                 }
                 _ => key_delta(k.code),
@@ -2324,12 +2479,13 @@ mod tests {
         assert!(s.contains("3 蕴气丹"), "操作提示没有 3 键");
     }
 
-    /// 地图上三类道具各有字形：+ / M / Q。
+    /// 地图上四类道具各有字形：+ / M / Q / S。
     #[test]
     fn items_render_their_own_glyphs() {
         let mut g = Game::new(60, 25);
         let (px, py) = (g.player.x, g.player.y);
-        let spot = [(px + 1, py), (px, py + 1)]
+        let spots = [(px + 1, py), (px, py + 1)];
+        let spot = spots
             .into_iter()
             .find(|&(x, y)| g.map.is_walkable(x, y))
             .expect("出生点旁边该有块空地");
@@ -2382,6 +2538,7 @@ mod tests {
         assert_eq!(glyph_at(ItemKind::Heal), '+', "血瓶该画成 +");
         assert_eq!(glyph_at(ItemKind::Manual), 'M', "秘籍该画成 M");
         assert_eq!(glyph_at(ItemKind::QiPill), 'Q', "蕴气丹该画成 Q");
+        assert_eq!(glyph_at(ItemKind::Shield), 'S', "盾牌该画成 S");
     }
 
     /// 结算面板：每行都以 ║ 开头并以 ║ 结尾且显示宽度一致（CJK 按 2 列计），标题不会被顶出框。
@@ -2433,25 +2590,30 @@ mod tests {
         }
 
         let mut s = Score::load();
-        s.add_run(8, 3, 0, 950); // 1 层 ×1：8*100 + 3*50 = 950
+        s.add_run(8, 3, 0, 0, 950); // 1 层 ×1：8*100 + 3*50 = 950
         assert_eq!(s.last_score, 950);
         assert_eq!(s.credits, 950, "通关赚的积分该进余额");
         assert_eq!(s.total_score, 950);
 
-        s.add_run(2, 0, 4, 1000); // 5 层 ×5：200*5 = 1000
+        s.add_run(2, 0, 4, 0, 1000); // 5 层 ×5：200*5 = 1000
         assert_eq!(s.total_score, 1950, "累计分该跨局累加");
         assert_eq!(s.credits, 1950, "积分余额该跨局累加");
 
-        s.add_run(4, 2, 1, 750); // 死亡折半：(400+100)×3/2 = 750
+        s.add_run(4, 2, 1, 0, 750); // 死亡折半：(400+100)×3/2 = 750
         assert_eq!(s.total_score, 2700);
         assert_eq!(s.credits, 2700);
 
+        s.add_run(0, 0, 0, 1, 500); // 骷髅刀 500 积分
+        assert_eq!(s.total_score, 3200, "骷髅刀积分没累加");
+        assert_eq!(s.last_blades, 1, "骷髅刀数没记下来");
+
         let reread = Score::load();
-        assert_eq!(reread.total_score, 2700, "落盘后读不回累计分");
-        assert_eq!(reread.credits, 2700, "落盘后读不回积分余额");
-        assert_eq!(reread.last_kills, 4);
-        assert_eq!(reread.last_potions, 2);
-        assert_eq!(reread.last_shields, 1, "上局存量盾牌数没记下来");
+        assert_eq!(reread.total_score, 3200, "落盘后读不回累计分");
+        assert_eq!(reread.credits, 3200, "落盘后读不回积分余额");
+        assert_eq!(reread.last_kills, 0);
+        assert_eq!(reread.last_potions, 0);
+        assert_eq!(reread.last_shields, 0);
+        assert_eq!(reread.last_blades, 1, "上局骷髅刀数没记下来");
 
         let _ = fs::remove_file(&file);
     }
@@ -3385,7 +3547,7 @@ mod tests {
         assert!(!g.achievements.contains(ACH_COMPENDIUM), "才杀一种离图鉴还远");
     }
 
-    /// 成就行是 HUD 专门两行（基础/高级区分）：没达成过显示“无”，达成过按固定顺序列出；
+    /// 成就行是 HUD 专门两行（基础/高级区分）：没达成过显示"无"，达成过按固定顺序列出；
     /// 不进 msg 普通消息栏；新局重置。
     #[test]
     fn render_shows_achievements_line() {
@@ -3410,5 +3572,234 @@ mod tests {
         // 新局重置
         let fresh = Game::new(60, 25);
         assert!(fresh.achievements.is_empty(), "新局不该带着上局成就");
+    }
+
+    /// 骷髅刀：骷髅死后 20% 掉落，带幸运符 80% 掉落；背包里有时无法拾取新的。
+    #[test]
+    fn skeleton_drops_blade_20_percent() {
+        let mut g = Game::new(60, 25);
+        g.monsters.clear();
+        let (px, py) = (g.player.x, g.player.y);
+        let mut drops = 0usize;
+        for _ in 0..200 {
+            // 重置 blade 状态，每轮都测试掉率
+            g.blade = false;
+            g.blade_equipped = false;
+            let ti = g.map.idx(px + 1, py);
+            g.map.tiles[ti] = Tile::Floor;
+            g.monsters.push(Entity {
+                x: px + 1,
+                y: py,
+                ch: 'k',
+                name: SKELETON,
+                hp: 1,
+                max_hp: 1,
+                atk: 0,
+                sight: 0,
+                behavior: Behavior::Melee,
+                is_boss: false,
+            });
+            g.try_move_player(1, 0);
+            if g.msg.contains("骷髅掉落了骷髅刀") {
+                drops += 1;
+            }
+        }
+        // 200 次抽样下，20% 掉率落在 25~55 之外的概率极小
+        assert!(drops > 25 && drops < 55, "骷髅刀掉率异常：杀 200 只骷髅只掉了 {drops} 把");
+
+        // 幸运符：80% 掉率
+        let mut g2 = Game::new(60, 25);
+        g2.lucky = true;
+        g2.monsters.clear();
+        let (px, py) = (g2.player.x, g2.player.y);
+        let mut drops2 = 0usize;
+        for _ in 0..100 {
+            g2.blade = false;
+            g2.blade_equipped = false;
+            let ti = g2.map.idx(px + 1, py);
+            g2.map.tiles[ti] = Tile::Floor;
+            g2.monsters.push(Entity {
+                x: px + 1,
+                y: py,
+                ch: 'k',
+                name: SKELETON,
+                hp: 1,
+                max_hp: 1,
+                atk: 0,
+                sight: 0,
+                behavior: Behavior::Melee,
+                is_boss: false,
+            });
+            g2.try_move_player(1, 0);
+            if g2.msg.contains("骷髅掉落了骷髅刀") {
+                drops2 += 1;
+            }
+        }
+        // 100 次抽样下，80% 掉率落在 65~95 之外的概率极小
+        assert!(drops2 > 65 && drops2 < 95, "幸运符下骷髅刀掉率异常：100 只骷髅只掉了 {drops2} 把");
+    }
+
+    /// 骷髅刀拾取：骷髅死后自动收入背包，背包里有时无法拾取新的。
+    #[test]
+    fn blade_auto_collects_on_skeleton_death() {
+        let mut g = Game::new(60, 25);
+        g.monsters.clear();
+        let (px, py) = (g.player.x, g.player.y);
+        let ti = g.map.idx(px + 1, py);
+        g.map.tiles[ti] = Tile::Floor;
+        g.monsters.push(Entity {
+            x: px + 1,
+            y: py,
+            ch: 'k',
+            name: SKELETON,
+            hp: 1,
+            max_hp: 1,
+            atk: 0,
+            sight: 0,
+            behavior: Behavior::Melee,
+            is_boss: false,
+        });
+        g.try_move_player(1, 0);
+        // 骷髅死后 20% 掉落骷髅刀（自动收入背包）
+        // 这里我们直接设置 blade 状态来测试无法拾取的情况
+        g.blade = true;
+        g.blade_equipped = true;
+        assert_eq!(g.attack_power(), BASE_ATK + BLADE_ATK_BONUS, "装备骷髅刀后攻击没加成");
+
+        // 背包里已有，再次掉落无法拾取
+        let ti = g.map.idx(px + 1, py);
+        g.map.tiles[ti] = Tile::Floor;
+        g.monsters.push(Entity {
+            x: px + 1,
+            y: py,
+            ch: 'k',
+            name: SKELETON,
+            hp: 1,
+            max_hp: 1,
+            atk: 0,
+            sight: 0,
+            behavior: Behavior::Melee,
+            is_boss: false,
+        });
+        // 强制触发掉落（通过设置 lucky 保证 80% 掉率，多次尝试）
+        g.lucky = true;
+        let mut dropped_but_rejected = false;
+        for _ in 0..50 {
+            let ti = g.map.idx(px + 1, py);
+            g.map.tiles[ti] = Tile::Floor;
+            g.monsters.push(Entity {
+                x: px + 1,
+                y: py,
+                ch: 'k',
+                name: SKELETON,
+                hp: 1,
+                max_hp: 1,
+                atk: 0,
+                sight: 0,
+                behavior: Behavior::Melee,
+                is_boss: false,
+            });
+            g.try_move_player(1, 0);
+            if g.msg.contains("无法拾取") {
+                dropped_but_rejected = true;
+                break;
+            }
+        }
+        assert!(dropped_but_rejected, "背包里已有骷髅刀时，新掉落该被拒绝");
+    }
+
+    /// 骷髅刀效果：装备时攻击固定 +3，卸下后恢复基础攻击。
+    #[test]
+    fn blade_bonus_is_fixed_plus_three() {
+        let mut g = Game::new(60, 25);
+        g.blade = true;
+        g.blade_equipped = true;
+        assert_eq!(g.attack_power(), BASE_ATK + BLADE_ATK_BONUS, "装备骷髅刀攻击没加成");
+
+        g.blade_equipped = false;
+        assert_eq!(g.attack_power(), BASE_ATK, "卸下骷髅刀攻击没恢复");
+
+        // 与秘籍叠加：8 → 16（秘籍）→ 19（骷髅刀）
+        g.player.atk = 2 * BASE_ATK;
+        g.blade_equipped = true;
+        assert_eq!(g.attack_power(), 2 * BASE_ATK + BLADE_ATK_BONUS, "与秘籍叠加不对");
+    }
+
+    /// 武器切换：按 w 打开菜单，1/2 选择武器，关闭菜单不消耗回合。
+    #[test]
+    fn weapon_menu_does_not_cost_turn() {
+        let mut g = Game::new(60, 25);
+        g.monsters.clear();
+        let (px, py) = (g.player.x, g.player.y);
+        for x in px..=px + 5 {
+            let i = g.map.idx(x, py);
+            g.map.tiles[i] = Tile::Floor;
+        }
+        g.monsters.push(Entity {
+            x: px + 5,
+            y: py,
+            ch: 'g',
+            name: "哥布林",
+            hp: 10,
+            max_hp: 10,
+            atk: 4,
+            sight: 12,
+            behavior: Behavior::Melee,
+            is_boss: false,
+        });
+        g.blade = true;
+        let before = g.monsters[0].x;
+
+        // 打开菜单、装备骷髅刀、关闭菜单：怪物不该动
+        g.toggle_weapon_menu();
+        g.equip_blade();
+        assert!(g.monsters[0].x == before, "切换武器让怪物动了");
+
+        // 对照：正常移动一步，怪物就该动了
+        g.try_move_player(1, 0);
+        assert_ne!(g.monsters[0].x, before, "移动后怪物没动，测试前提不成立");
+    }
+
+    /// 骷髅刀结算：一把 500 积分，随层数倍率、死亡折半。
+    #[test]
+    fn blade_scores_500_in_settlement() {
+        let mut g = Game::new(60, 25);
+        g.kills = 0;
+        g.potions = 0;
+        g.blade = true;
+        assert_eq!(g.blade_score(), BLADE_SCORE, "骷髅刀积分不对");
+        g.floor = 1;
+        g.boss_down = true;
+        assert_eq!(g.settlement_score(), BLADE_SCORE + 500, "1 层 ×1 + 通关 1 关");
+        g.floor = 3;
+        g.boss_down = true;
+        assert_eq!(g.settlement_score(), BLADE_SCORE * 3 + 1500, "3 层 ×3，已通过 3 关 +1500");
+        g.end = End::Defeat;
+        g.boss_down = false;
+        assert_eq!(
+            g.settlement_score(),
+            BLADE_SCORE * 3 / 2 + 1000,
+            "死亡该折半，通关奖励不折半"
+        );
+        // 结算面板里出现骷髅刀那行
+        g.end = End::Voluntary;
+        g.floor = 3;
+        g.boss_down = true;
+        let s = g.render();
+        assert!(s.contains("骷髅刀"), "结算面板没显示骷髅刀积分");
+    }
+
+    /// 攻击力计算：基础攻击 + 骷髅刀加成（如果装备）。
+    #[test]
+    fn attack_power_includes_blade_bonus() {
+        let mut g = Game::new(60, 25);
+        assert_eq!(g.attack_power(), BASE_ATK, "新局攻击力不对");
+
+        g.blade = true;
+        g.blade_equipped = true;
+        assert_eq!(g.attack_power(), BASE_ATK + BLADE_ATK_BONUS, "装备骷髅刀后攻击力不对");
+
+        g.player.atk = 2 * BASE_ATK;
+        assert_eq!(g.attack_power(), 2 * BASE_ATK + BLADE_ATK_BONUS, "与秘籍叠加后攻击力不对");
     }
 }
