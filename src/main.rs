@@ -35,7 +35,7 @@ const POTIONS_PER_FLOOR: usize = 4;
 /// 怪物死亡时掉落血瓶的概率（1/2）。
 const DROP_CHANCE: u32 = 2;
 /// 背包最多容纳多少个血瓶，捡到就往里塞。
-const POTION_STACK: usize = 5;
+const POTION_STACK: usize = 10;
 /// 玩家的初始血量上限与攻击力，重开新一局时回到这个水平。
 const BASE_MAX_HP: i32 = 40;
 const BASE_ATK: i32 = 8;
@@ -49,7 +49,9 @@ const PRICE_TALISMAN: u32 = 5000;
 /// 结算时每通过一关（守护者倒下）的固定通关奖励积分，不受层数倍率和折半影响。
 const CLEAR_BONUS_PER_FLOOR: u32 = 500;
 /// 骷髅在基础攻击上额外增加的攻击数值（骷髅本就穿盾，更危险）。
-const SKELETON_ATK_BONUS: i32 = 4;
+const SKELETON_ATK_BONUS: i32 = 2;
+/// 骷髅攻击力上限：再强也不超过这个数。
+const MAX_SKELETON_ATK: i32 = 15;
 const PRICE_POTION: u32 = 200;
 /// 血瓶每局限购数量，再买没意义（背包上限也不高）。
 const MAX_POTION_BUY: usize = 3;
@@ -1124,11 +1126,13 @@ fn populate(floor: u8, map: &Map) -> (Vec<Entity>, Vec<Item>) {
                 let t = (i - 1) % 4; // 小怪种类循环：哥布林/巨鼠/蜘蛛/骷髅
                 let name = ["哥布林", "巨鼠", "蜘蛛", SKELETON][t];
                 let skeleton_bonus = if name == SKELETON { SKELETON_ATK_BONUS } else { 0 };
+                let base_atk = 3 + i as i32 + 2 * (f - 1) + skeleton_bonus;
+                let atk = if name == SKELETON { base_atk.min(MAX_SKELETON_ATK) } else { base_atk };
                 (
                     name,
                     ['g', 'r', 's', 'k'][t],
                     floor_hp(10 + (i as i32) * 4, f),
-                    3 + i as i32 + 2 * (f - 1) + skeleton_bonus,
+                    atk,
                     8,
                     Behavior::Melee,
                 )
