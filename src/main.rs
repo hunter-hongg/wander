@@ -10,8 +10,8 @@ use crossterm::{
 };
 use std::io::{stdout, Write};
 
-use crate::game::{key_delta, End, Game, MAX_FLOOR, Ownership, Score};
-use crate::ui::{run_homepage, run_shop, HomepageResult};
+use crate::game::{key_delta, ArmorSlot, End, Game, MAX_FLOOR, Ownership, Score};
+use crate::ui::{run_armor, run_homepage, run_shop, HomepageResult};
 
 fn main() -> std::io::Result<()> {
     enable_raw_mode()?;
@@ -44,6 +44,10 @@ fn main_loop(vw: usize, vh: usize, stdout: &mut std::io::Stdout) -> std::io::Res
                 match result {
                     GameResult::BackToHome => continue, // 回首页
                 }
+            }
+            HomepageResult::Armor => {
+                run_armor(stdout)?;
+                continue; // 盔甲页返回 → 回首页
             }
             HomepageResult::Quit => return Ok(()),
         }
@@ -117,6 +121,23 @@ fn run_game(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<Ga
                 }
                 continue;
             }
+            // 盔甲菜单模态：打开时按键只响应菜单，其他按键忽略（仅在游戏进行中）
+            if game.armor_menu && matches!(game.end, End::None) {
+                match k.code {
+                    KeyCode::Char('1') => game.toggle_armor_slot(ArmorSlot::Helmet),
+                    KeyCode::Char('2') => game.toggle_armor_slot(ArmorSlot::Chest),
+                    KeyCode::Char('3') => game.toggle_armor_slot(ArmorSlot::Legs),
+                    KeyCode::Char('4') => game.toggle_armor_slot(ArmorSlot::Bracer),
+                    KeyCode::Char('e') | KeyCode::Esc => {
+                        game.toggle_armor_menu();
+                    }
+                    _ => {
+                        game.armor_menu = false;
+                        game.msg = "关闭盔甲菜单".to_string();
+                    }
+                }
+                continue;
+            }
             let delta = match k.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('a') => {
@@ -162,6 +183,10 @@ fn run_game(game: &mut Game, stdout: &mut std::io::Stdout) -> std::io::Result<Ga
                 }
                 KeyCode::Char('w') => {
                     game.toggle_weapon_menu();
+                    continue;
+                }
+                KeyCode::Char('e') => {
+                    game.toggle_armor_menu();
                     continue;
                 }
                 _ => key_delta(k.code),

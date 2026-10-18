@@ -67,6 +67,10 @@ pub(crate) const UPGRADE_COST: usize = 20;
 pub(crate) const BLADE_SCORE: u32 = 500;
 /// 骷髅刀单局在背包里的堆叠上限：拾取只进背包，结算时转库存。
 pub(crate) const BLADE_STACK_MAX: usize = 10;
+/// 盔甲堆叠上限：每个种类单独计数。
+pub(crate) const MAX_ARMOR_STACK: usize = 10;
+/// 盔甲耐久上限。当前耐久不参与战斗、不会消耗，先把数据模型立住。
+pub(crate) const ARMOR_MAX_DURABILITY: i32 = 500;
 /// 骷髅刀对盾卫的穿透概率（%）：直接无视盾牌造成伤害，幸运符不提升。
 pub(crate) const BLADE_PIERCE_CHANCE: u32 = 50;
 /// 暗影弓：暗影射手死后 20% 掉落；带幸运符提升至 80%。
@@ -182,6 +186,11 @@ pub(crate) enum ItemKind {
     QiPill, // 蕴气丹：耗 10 血，血量上限 +10
     Shield, // 盾牌：格挡怪物的攻击（骷髅与守护者暗箭除外），每次命中消耗 1 点耐久
     Bow, // 暗影弓：暗影射手 20% 掉落（幸运符 80%），装备后攻击范围 4 格、伤害 ÷2
+    /// 盔甲：无实际效果，仅拾取、存储和数据显示
+    ArmorHelmet, // 暗影晶头盔 - 防御从高到低第一
+    ArmorChest,   // 暗影晶胸甲
+    ArmorLegs,    // 暗影晶腿甲
+    ArmorBracer,  // 暗影晶护腕 - 防御从高到低最低
 }
 
 /// 道具在地图上的显示字符。
@@ -192,6 +201,115 @@ pub(crate) fn item_glyph(kind: ItemKind) -> char {
         ItemKind::QiPill => 'Q',
         ItemKind::Shield => 'S',
         ItemKind::Bow => 'B',
+        ItemKind::ArmorHelmet => 'A', // 暗影晶头盔
+        ItemKind::ArmorChest => 'C',   // 暗影晶胸甲
+        ItemKind::ArmorLegs => 'L',    // 暗影晶腿甲
+        ItemKind::ArmorBracer => 'W',  // 暗影晶护腕
+    }
+}
+
+/// 盔甲部位，展示顺序即防御从高到低。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ArmorSlot {
+    Helmet,
+    Chest,
+    Legs,
+    Bracer,
+}
+
+impl ArmorSlot {
+    pub(crate) const ALL: [ArmorSlot; 4] = [
+        ArmorSlot::Helmet,
+        ArmorSlot::Chest,
+        ArmorSlot::Legs,
+        ArmorSlot::Bracer,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ArmorSlot::Helmet => "暗影晶头盔",
+            ArmorSlot::Chest => "暗影晶胸甲",
+            ArmorSlot::Legs => "暗影晶腿甲",
+            ArmorSlot::Bracer => "暗影晶护腕",
+        }
+    }
+
+    /// 该部位在永久库存里的存量（去掉当前穿着中的 1 件）。
+    /// 当前穿着的一套算在总数里，因此库存存量 = 总数 - 1，不足 0 时显示 0。
+    pub(crate) fn stock(self, own: &Ownership) -> usize {
+        let total = match self {
+            ArmorSlot::Helmet => own.armor_helmet,
+            ArmorSlot::Chest => own.armor_chest,
+            ArmorSlot::Legs => own.armor_legs,
+            ArmorSlot::Bracer => own.armor_bracer,
+        };
+        // 存量 = 总数 - 1（当前穿着的一件），负不可能，至少显示 0
+        total.saturating_sub(1)
+    }
+    /// 当前穿着的一套里该部位的耐久。
+    /// 未拥有该部位盔甲（总数为 0）时返回 0，而非 struct 默认的 500。
+    pub(crate) fn durability(self, own: &Ownership) -> i32 {
+        let total = match self {
+            ArmorSlot::Helmet => own.armor_helmet,
+            ArmorSlot::Chest => own.armor_chest,
+            ArmorSlot::Legs => own.armor_legs,
+            ArmorSlot::Bracer => own.armor_bracer,
+        };
+        if total == 0 {
+            return 0;
+        }
+        match self {
+            ArmorSlot::Helmet => own.armor_durability.helmet,
+            ArmorSlot::Chest => own.armor_durability.chest,
+            ArmorSlot::Legs => own.armor_durability.legs,
+            ArmorSlot::Bracer => own.armor_durability.bracer,
+        }
+    }
+
+    /// 该部位穿戴后的伤害保留系数：伤害 × 该系数；全套为各系数连乘
+    /// （头盔 0.5、胸甲 0.6、腿甲 0.8、护腕 0.9）。
+    pub(crate) fn factor(self) -> f64 {
+        match self {
+            ArmorSlot::Helmet => 0.5,
+            ArmorSlot::Chest => 0.6,
+            ArmorSlot::Legs => 0.8,
+            ArmorSlot::Bracer => 0.9,
+        }
+    }
+
+    /// 该部位在 worn/cur 等数组里的下标（顺序与 ALL 一致）。
+    pub(crate) fn index(self) -> usize {
+        match self {
+            ArmorSlot::Helmet => 0,
+            ArmorSlot::Chest => 1,
+            ArmorSlot::Legs => 2,
+            ArmorSlot::Bracer => 3,
+        }
+    }
+
+}
+
+/// 当前永久库存里每个部位「正在使用的那件」的耐久。穿戴时受击会消耗，
+/// 耐久归零则该件碎裂、本局不可再用；结算时若有库存冗余件会顶上回满。
+/// 耐久随存档持久化（跨局），不会在一局内重置。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+#[serde(default)]
+pub(crate) struct ArmorDurability {
+    pub(crate) helmet: i32,
+    pub(crate) chest: i32,
+    pub(crate) legs: i32,
+    pub(crate) bracer: i32,
+}
+
+impl Default for ArmorDurability {
+    /// 新存档默认满耐久：固定 500/500。
+    fn default() -> Self {
+        ArmorDurability {
+            helmet: ARMOR_MAX_DURABILITY,
+            chest: ARMOR_MAX_DURABILITY,
+            legs: ARMOR_MAX_DURABILITY,
+            bracer: ARMOR_MAX_DURABILITY,
+        }
     }
 }
 
@@ -204,6 +322,13 @@ pub(crate) struct Ownership {
     pub(crate) shadow_bow: usize,     // 库存里的暗影弓数量
     pub(crate) blade_level: u8,       // 骷髅刀等级（0 或 1）
     pub(crate) bow_level: u8,         // 暗影弓等级（0 或 1）
+    pub(crate) armor_helmet: usize,   // 库存里的暗影晶头盔数量
+    pub(crate) armor_chest: usize,    // 库存里的暗影晶胸甲数量
+    pub(crate) armor_legs: usize,     // 库存里的暗影晶腿甲数量
+    pub(crate) armor_bracer: usize,   // 库存里的暗影晶护腕数量
+    /// 每个部位当前「正在使用的那件」的耐久（受击会消耗、跨局持久化）；
+    /// 穿戴开启减伤，耐久归零则本局碎裂不可再用，结算时库存冗余件顶上回满。
+    pub(crate) armor_durability: ArmorDurability,
 }
 
 impl Ownership {
@@ -232,6 +357,29 @@ impl Ownership {
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(&path, serde_json::to_string_pretty(self).unwrap_or_default());
+    }
+
+
+    /// 结算顶上：对每个耐久耗尽（0）且库存还有冗余件（总数 >= 2）的部位，
+    /// 消耗一件冗余件、回复耐久上限。被砸碎但无冗余的部位保持 0。
+    pub(crate) fn top_up_broken_slots(&mut self) {
+        for slot in ArmorSlot::ALL {
+            let (total, dur) = self.armor_piece_mut(slot);
+            if *dur == 0 && *total >= 2 {
+                *total -= 1;
+                *dur = ARMOR_MAX_DURABILITY;
+            }
+        }
+    }
+
+    /// 借出 (总数, 耐久) 二者的可变引用（供 top_up_broken_slots 内部使用）。
+    fn armor_piece_mut(&mut self, slot: ArmorSlot) -> (&mut usize, &mut i32) {
+        match slot {
+            ArmorSlot::Helmet => (&mut self.armor_helmet, &mut self.armor_durability.helmet),
+            ArmorSlot::Chest => (&mut self.armor_chest, &mut self.armor_durability.chest),
+            ArmorSlot::Legs => (&mut self.armor_legs, &mut self.armor_durability.legs),
+            ArmorSlot::Bracer => (&mut self.armor_bracer, &mut self.armor_durability.bracer),
+        }
     }
 }
 
@@ -316,6 +464,16 @@ pub(crate) struct Game {
     pub(crate) lucky: bool, // 本局用了幸运符：血瓶掉率 90%，秘籍 25% 概率攻击 ×4，盾牌必掉，结算积分折半
     pub(crate) achievements: HashSet<&'static str>, // 本局达成的成就（仅图一乐，HUD 基础/高级分行展示，随新局重置）
     pub(crate) arrows_blocked: usize, // 本局盾挡下的射手暗箭总数（不再畏惧成就攒到 NO_FEAR_ARROWS 达成）
+    // 盔甲拾取计数：本局收集的各部位盔甲（结算时累计进永久库存）
+    pub(crate) helmet_count: usize, // 暗影晶头盔
+    pub(crate) chest_count: usize,  // 暗影晶胸甲
+    pub(crate) legs_count: usize,   // 暗影晶腿甲
+    pub(crate) bracer_count: usize, // 暗影晶护腕
+    // 以下字段记录本局盔甲穿戴与耐久，耐久跨局持久化
+    pub(crate) armor_worn: [bool; 4], // 各部位是否已穿戴（索引 = ArmorSlot::index）
+    pub(crate) armor_total: [usize; 4], // 各部位库存总数（含正在用的那件），来自永久库存
+    pub(crate) armor_cur: ArmorDurability, // 本局各部位当前耐久（= 库存的那件正在用盔甲的耐久）
+    pub(crate) armor_menu: bool,      // 盔甲穿戴窗口（模态，不消耗回合）
     pub(crate) species_killed: HashSet<&'static str>, // 本局击杀过的怪物种类（怪物图鉴成就用）
     pub(crate) msg: String,
     pub(crate) vw: usize, // 实际渲染宽度（受终端窗口限制）
@@ -394,23 +552,49 @@ impl Game {
             arrows_blocked: 0,
             species_killed: HashSet::new(),
             msg: String::from(
-                "地牢共 7 层，越深越难。h/j/k/l 移动，按 a 攻击八方向 1 格内的怪物。杀掉本层守护者 D 后按 d 下楼或 g 结算。+ 血瓶 / M 武林秘籍 / Q 蕴气丹 / S 盾牌 / † 骷髅刀（骷髅掉落）/ B 暗影弓（暗影射手 20% 掉落，幸运符 80%）。w 切换武器，菜单里可升级武器（需 20 把同类武器）。6-7 层骷髅绝迹，近战换成举破盾的盾卫 t，守护者 D 还会在 20 格外射透盾的暗箭"
+                "地牢共 7 层，越深越难。h/j/k/l 移动，按 a 攻击八方向 1 格内的怪物。杀掉本层守护者 D 后按 d 下楼或 g 结算。+ 血瓶 / M 武林秘籍 / Q 蕴气丹 / S 盾牌 / † 骷髅刀（骷髅掉落）/ B 暗影弓（暗影射手 20% 掉落，幸运符 80%）。A/C/L/W 暗影晶盔甲（6-7 层守护者掉落），按 e 开盔甲菜单穿戴（头盔0.5/胸甲0.6/腿甲0.8/护腕0.9 叠乘减伤，耐久随受击消耗、跨局持久，碎裂后结算用库存顶上）。w 切换武器，菜单里可升级武器（需 20 把同类武器）。6-7 层骷髅绝迹，近战换成举破盾的盾卫 t，守护者 D 还会在 20 格外射透盾的暗箭"
             ),
             vw: vw.min(W),
             // 5 行头部（标题/物品/工具/基础成就/高级成就）+ 地图 + 1 行消息 + 1 行按键提示
             vh: (vh.saturating_sub(7)).min(H),
+            helmet_count: 0,
+            chest_count: 0,
+            legs_count: 0,
+            bracer_count: 0,
+            // 进入游戏默认不穿戴盔甲；各部位耐久与库存总数从永久库存继承
+            armor_worn: [false; 4],
+            armor_total: [
+                ownership.armor_helmet,
+                ownership.armor_chest,
+                ownership.armor_legs,
+                ownership.armor_bracer,
+            ],
+            armor_cur: ownership.armor_durability,
+            armor_menu: false,
         };
         game.map.recompute_vision(game.player.x, game.player.y, 8);
         game
     }
 
-    /// 本局结束后把背包里的武器数量累计进永久库存（原来没有就当作从 0 开始累加）。
+    /// 本局结束后把背包里的武器/盔甲数量累计进永久库存。
+    /// 盔甲耐久（跨局持久化）也一并回存：碎裂的部位（耐久 0）若库存还有冗余件，
+    /// 结算后用一件冗余件顶上、回满耐久 500，耗掉一件库存存量。
     pub(crate) fn save_ownership(&self) {
         let mut ownership = Ownership::load();
         ownership.skeleton_blade += self.blade_count;
         ownership.shadow_bow += self.bow_count;
         ownership.blade_level = self.blade_level;
         ownership.bow_level = self.bow_level;
+        // 盔甲计数累计进库存
+        ownership.armor_helmet += self.helmet_count;
+        ownership.armor_chest += self.chest_count;
+        ownership.armor_legs += self.legs_count;
+        ownership.armor_bracer += self.bracer_count;
+        // 回存本局盔甲耐久（跨局持久化）
+        ownership.armor_durability = self.armor_cur;
+        // 结算后库存顶上：耐久耗尽的部位，若还有冗余件（总数 >= 2），
+        // 消耗一件冗余件、回复耐久上限。被砸碎但没库存的部位保持 0，下次收藏再顶上。
+        ownership.top_up_broken_slots();
         ownership.save();
     }
 
@@ -499,6 +683,25 @@ impl Game {
                 self.msg.push_str("（暗影射手掉落了一把暗影弓）");
             }
         }
+        // 6-7 层守护者掉落盔甲：基础 10%，幸运符 25%；掉落 4 种盔甲的一种，每个部位最多拾取 10 件
+        if m.is_boss && self.floor >= 6 {
+            let armor_drop = if self.lucky {
+                rng.random_range(0..100) < 25
+            } else {
+                rng.random_range(0..100) < 10
+            };
+            if armor_drop {
+                let armor_type = rng.random_range(0..4);
+                let (item_kind, display_name) = match armor_type {
+                    0 => (ItemKind::ArmorHelmet, "暗影晶头盔"),
+                    1 => (ItemKind::ArmorChest, "暗影晶胸甲"),
+                    2 => (ItemKind::ArmorLegs, "暗影晶腿甲"),
+                    _ => (ItemKind::ArmorBracer, "暗影晶护腕"),
+                };
+                self.items.push(Item { x: m.x, y: m.y, kind: item_kind });
+                self.msg.push_str(&format!("（{}掉落了盔甲！）", display_name));
+            }
+        }
         self.unlock(ACH_KILL_ONE); // 杀死怪物：击杀一只即达成
         self.register_kill(m.name); // 怪物图鉴：记账击杀过的种类
     }
@@ -569,13 +772,18 @@ impl Game {
                     self.msg = format!("你击杀了{}！", name);
                     if m.is_boss {
                         self.boss_down = true;
-                        if self.floor == MAX_FLOOR {
-                            self.end = End::Victory; // 第 7 层守护者倒下：整局通关，结算落盘由 run 循环统一做
-                        } else {
+                        if self.floor != MAX_FLOOR {
                             self.msg.push_str(&format!(
                                 " 第{}层的守护者倒下了！按 d 下到第{}层（怪物更强、射手更多），按 g 结束本局回商店结算（积分 ×{}）",
                                 self.floor,
                                 self.floor + 1,
+                                self.floor
+                            ));
+                        } else {
+                            // 最后一层：按 d 通关
+                            self.msg.push_str(&format!(
+                                " 地牢第{}层的守护者倒下了！按 d 通关整局游戏，或按 g 结束本局回商店结算（积分 ×{}）",
+                                self.floor,
                                 self.floor
                             ));
                         }
@@ -684,6 +892,67 @@ impl Game {
                     self.msg = format!(
                         "捡起暗影弓（背包 {}/{}），按 w 装备",
                         self.bow_count, BOW_STACK_MAX
+                    );
+                }
+                // 盔甲：无实际效果，仅拾取、存储和数据显示，每个部位独立堆叠上限
+                ItemKind::ArmorHelmet => {
+                    if self.helmet_count >= MAX_ARMOR_STACK {
+                        self.msg = format!(
+                            "暗影晶头盔已满（{}/{}），留在原地",
+                            self.helmet_count, MAX_ARMOR_STACK
+                        );
+                        return;
+                    }
+                    self.helmet_count += 1;
+                    self.items.remove(i);
+                    self.msg = format!(
+                        "捡起暗影晶头盔（背包 {}/{}）",
+                        self.helmet_count, MAX_ARMOR_STACK
+                    );
+                }
+                ItemKind::ArmorChest => {
+                    if self.chest_count >= MAX_ARMOR_STACK {
+                        self.msg = format!(
+                            "暗影晶胸甲已满（{}/{}），留在原地",
+                            self.chest_count, MAX_ARMOR_STACK
+                        );
+                        return;
+                    }
+                    self.chest_count += 1;
+                    self.items.remove(i);
+                    self.msg = format!(
+                        "捡起暗影晶胸甲（背包 {}/{}）",
+                        self.chest_count, MAX_ARMOR_STACK
+                    );
+                }
+                ItemKind::ArmorLegs => {
+                    if self.legs_count >= MAX_ARMOR_STACK {
+                        self.msg = format!(
+                            "暗影晶腿甲已满（{}/{}），留在原地",
+                            self.legs_count, MAX_ARMOR_STACK
+                        );
+                        return;
+                    }
+                    self.legs_count += 1;
+                    self.items.remove(i);
+                    self.msg = format!(
+                        "捡起暗影晶腿甲（背包 {}/{}）",
+                        self.legs_count, MAX_ARMOR_STACK
+                    );
+                }
+                ItemKind::ArmorBracer => {
+                    if self.bracer_count >= MAX_ARMOR_STACK {
+                        self.msg = format!(
+                            "暗影晶护腕已满（{}/{}），留在原地",
+                            self.bracer_count, MAX_ARMOR_STACK
+                        );
+                        return;
+                    }
+                    self.bracer_count += 1;
+                    self.items.remove(i);
+                    self.msg = format!(
+                        "捡起暗影晶护腕（背包 {}/{}）",
+                        self.bracer_count, MAX_ARMOR_STACK
                     );
                 }
             }
@@ -924,6 +1193,86 @@ impl Game {
         ownership.save();
     }
 
+    /// 按 e：打开/关闭盔甲穿戴窗口（模态，不消耗回合）。窗口内按 1-4 穿戴/脱下对应部位。
+    pub(crate) fn toggle_armor_menu(&mut self) {
+        if self.player.hp <= 0 || !matches!(self.end, End::None) {
+            return; // 死了或本局结算了不能操作盔甲
+        }
+        self.armor_menu = !self.armor_menu;
+        if self.armor_menu {
+            let worn_names = self.armor_slot_list();
+            self.msg = format!(
+                "盔甲穿戴：[1] 头盔  [2] 胸甲  [3] 腿甲  [4] 护腕  穿戴中{}  按 e 关闭，按对应数字穿戗/脱下",
+                worn_names
+            );
+        } else {
+            self.msg = "关闭盔甲菜单".to_string();
+        }
+    }
+
+    /// 切换某个部位的穿戴状态（菜单按键 1-4）。
+    /// 只能穿戴曾拥有的且耐久 > 0 的部位；耐久为 0 的部位已碎裂，本局不可使用库存更换。
+    pub(crate) fn toggle_armor_slot(&mut self, slot: ArmorSlot) {
+        if self.player.hp <= 0 || !matches!(self.end, End::None) {
+            return;
+        }
+        let idx = slot.index();
+        if self.armor_total[idx] == 0 {
+            self.msg = format!("{}还没获得过，无法穿戴（6-7 层守护者掉落）", slot.name());
+            return;
+        }
+        if self.armor_cur_durability(slot) == 0 {
+            // 耐久为 0 = 碎裂，本局不能靠库存顶上（等结算）
+            self.msg = format!("{}已碎裂，耐久为 0，结算后若有库存可顶上", slot.name());
+            return;
+        }
+        let was = self.armor_worn[idx];
+        self.armor_worn[idx] = !was;
+        let (verb, factor) = if self.armor_worn[idx] {
+            ("穿戴", slot.factor())
+        } else {
+            ("脱下", slot.factor())
+        };
+        let reduce = ((1.0 - factor) * 100.0) as i32;
+        self.msg = format!(
+            "{} {} 了！本伤害 ×{:.1}（抵伤 {}%）。",
+            slot.name(),
+            verb,
+            factor,
+            reduce
+        );
+    }
+
+    /// 读取 worn 标志。
+    fn is_worn(&self, slot: ArmorSlot) -> bool {
+        self.armor_worn[slot.index()]
+    }
+
+    /// 读取当前耐久。
+    fn armor_cur_durability(&self, slot: ArmorSlot) -> i32 {
+        match slot {
+            ArmorSlot::Helmet => self.armor_cur.helmet,
+            ArmorSlot::Chest => self.armor_cur.chest,
+            ArmorSlot::Legs => self.armor_cur.legs,
+            ArmorSlot::Bracer => self.armor_cur.bracer,
+        }
+    }
+
+    /// 菜单/状态用：当前穿戴的部位名列表。
+    fn armor_slot_list(&self) -> String {
+        let names: Vec<&str> = ArmorSlot::ALL
+            .iter()
+            .copied()
+            .filter(|s| self.is_worn(*s))
+            .map(|s| s.name())
+            .collect();
+        if names.is_empty() {
+            " 无".to_string()
+        } else {
+            format!(" {}{}", names.join(" | "), "")
+        }
+    }
+
     /// 计算当前攻击力：基础攻击 + 骷髅刀加成（如果装备）；装备暗影弓时再 ÷2（0级）或 ×3/4（1级）。
     pub(crate) fn attack_power(&self) -> i32 {
         let mut base = self.player.atk;
@@ -989,9 +1338,9 @@ impl Game {
                                 shield_refill = true;
                             }
                             if !r.blocked {
-                                // 没盾（或骷髅穿盾）才掉血
-                                let dmg = roll(&mut rng, m.atk);
-                                self.player.hp -= dmg;
+                                // 没盾（或骷髅穿盾）才掉血，盔甲抵伤
+                                let raw = roll(&mut rng, m.atk);
+                                let dmg = take_armor_damage(&mut self.armor_worn, &mut self.armor_cur, &mut self.player.hp, raw, &mut hits);
                                 hits.push(format!("{}咬了你{}血（剩余{}）", m.name, dmg, self.player.hp));
                             }
                         }
@@ -1021,8 +1370,9 @@ impl Game {
                                 shield_refill = true;
                             }
                             if !r.blocked {
-                                let dmg = BOSS_DARK_ARROW_DMG + rng.random_range(-1..=1);
-                                self.player.hp -= dmg;
+                                // 暗箭穿盾直击，盔甲抵伤
+                                let raw = BOSS_DARK_ARROW_DMG + rng.random_range(-1..=1);
+                                let dmg = take_armor_damage(&mut self.armor_worn, &mut self.armor_cur, &mut self.player.hp, raw, &mut hits);
                                 hits.push(format!(
                                     "{}在{dist}格外锁定你，暗箭穿透盾牌射中{}血（剩余{}）",
                                     m.name, dmg, self.player.hp
@@ -1040,8 +1390,8 @@ impl Game {
                                 shield_refill = true;
                             }
                             if !r.blocked {
-                                let dmg = roll(&mut rng, m.atk);
-                                self.player.hp -= dmg;
+                                let raw = roll(&mut rng, m.atk);
+                                let dmg = take_armor_damage(&mut self.armor_worn, &mut self.armor_cur, &mut self.player.hp, raw, &mut hits);
                                 hits.push(format!("{}近身重击砸了你{}血（剩余{}）", m.name, dmg, self.player.hp));
                             }
                         }
@@ -1076,9 +1426,9 @@ impl Game {
                                 arrows_blocked += 1; // 不再畏惧：这发箭被盾挡下了
                             }
                             if !r.blocked {
-                                // 盾牌已在此命中后结算 1 点耐久；没盾才掉血
-                                let dmg = roll(&mut rng, m.atk);
-                                self.player.hp -= dmg;
+                                // 盾牌已在此命中后结算 1 点耐久；没盾才掉血，盔甲抵伤
+                                let raw = roll(&mut rng, m.atk);
+                                let dmg = take_armor_damage(&mut self.armor_worn, &mut self.armor_cur, &mut self.player.hp, raw, &mut hits);
                                 hits.push(format!("{}用暗影箭射你{}血（剩余{}）", m.name, dmg, self.player.hp));
                             }
                         }
@@ -1093,7 +1443,8 @@ impl Game {
                             shield_refill = true;
                         }
                         if !r.blocked {
-                            self.player.hp -= dmg;
+                            // 盔甲抵伤
+                            let dmg = take_armor_damage(&mut self.armor_worn, &mut self.armor_cur, &mut self.player.hp, dmg, &mut hits);
                             hits.push(format!(
                                 "{}近身暗影一击打你{}血（剩余{}）",
                                 m.name, dmg, self.player.hp
@@ -1145,14 +1496,20 @@ impl Game {
     pub(crate) fn descend(&mut self) {
         if self.player.hp <= 0
             || !self.boss_down
-            || self.floor >= MAX_FLOOR
             || !matches!(self.end, End::None)
         {
             if self.player.hp > 0 && matches!(self.end, End::None) && !self.boss_down {
-                self.msg = "先杀掉本层的守护者 D 才能下楼".to_string();
+                self.msg = "先杀掉本层的守护者 D 才能进行下一步".to_string();
             }
             return;
         }
+        // 第 7 层：按 d 完成游戏
+        if self.floor == MAX_FLOOR {
+            self.end = End::Victory;
+            self.msg.push_str(" 通关成功！进入结算界面");
+            return;
+        }
+        // 其他层：正常下楼
         self.floor += 1;
         let mut map = Map::new();
         map.generate(None);
@@ -1297,6 +1654,10 @@ impl Game {
             self.render_weapon_menu(&mut out, COLOR_ITEM_BLADE, COLOR_ITEM_BOW, COLOR_RESET);
             return out;
         }
+        if self.armor_menu && matches!(self.end, End::None) {
+            self.render_armor_menu(&mut out);
+            return out;
+        }
 
         if !matches!(self.end, End::None) {
             self.render_settlement(&mut out, COLOR_GOLD, COLOR_RESET);
@@ -1349,9 +1710,11 @@ impl Game {
         } else {
             COLOR_RESET
         };
+        // 盔甲简览：穿戴的部位显示耐久；未穿戴的部位显示「—」
+        let armor_line = self.render_armor_hud_line(COLOR_ITEM_BOW, COLOR_RESET);
         if self.shield > 0 {
             out.push_str(&format!(
-                "{}盾牌 {}/{}  武器：{}{}{COLOR_RESET}\r\n",
+                "{}盾牌 {}/{}  武器：{}{}{COLOR_RESET}  盔甲：{armor_line}\r\n",
                 COLOR_ITEM_SHIELD,
                 self.shield,
                 SHIELD_DURABILITY,
@@ -1360,7 +1723,7 @@ impl Game {
             ));
         } else {
             out.push_str(&format!(
-                "盾牌：无  武器：{}{}{COLOR_RESET}\r\n",
+                "盾牌：无  武器：{}{}{COLOR_RESET}  盔甲：{armor_line}\r\n",
                 weapon_color,
                 weapon_desc,
             ));
@@ -1402,14 +1765,18 @@ impl Game {
                         ItemKind::QiPill => COLOR_ITEM_QI,
                         ItemKind::Shield => COLOR_ITEM_SHIELD,
                         ItemKind::Bow => COLOR_ITEM_BOW,
+                        ItemKind::ArmorHelmet => COLOR_ITEM_BOW, // 用和弓一样的颜色
+                        ItemKind::ArmorChest => COLOR_ITEM_BOW,
+                        ItemKind::ArmorLegs => COLOR_ITEM_BOW,
+                        ItemKind::ArmorBracer => COLOR_ITEM_BOW,
                     };
                     (item_glyph(it.kind), c)
                 } else if !self.map.explored[i] {
                     (' ', COLOR_RESET)
                 } else {
                     match self.map.get(x, y) {
-                        Tile::Wall => ('#', COLOR_RESET),
-                        Tile::Floor => ('.', COLOR_RESET),
+                        Tile::Wall => ('#', "\x1b[90m"), // 灰色墙壁
+                        Tile::Floor => ('.', "\x1b[93m"), // 浅黄色地板
                     }
                 };
                 out.push_str(color);
@@ -1419,7 +1786,7 @@ impl Game {
             out.push_str("\r\n");
         }
         out.push_str(&format!(
-            "{}\r\nq 退出  g 结束本局/回商店（死亡或守护者倒下后）  d 下楼（守护者倒下后）  w 切换武器  a 攻击  1 血瓶  2 秘籍  3 蕴气丹  空格待机\r\n",
+            "{}\r\nq 退出  g 结束本局/回商店（死亡或守护者倒下后）  d 下楼（守护者倒下后）  w 切换武器  e 穿戴盔甲  a 攻击  1 血瓶  2 秘籍  3 蕴气丹  空格待机\r\n",
             self.msg
         ));
         out
@@ -1495,6 +1862,86 @@ impl Game {
             bow_status,
             reset
         ));
+        out.push_str(&format!("\r\n{}\r\n", self.msg));
+    }
+    /// 盔甲简览一行：按部位顺序显示 [x]耐久 / [ ]耐久 / ✗碎裂 / —未曾获得。
+    pub(crate) fn render_armor_hud_line(&self, armor_color: &str, reset: &str) -> String {
+        let parts: Vec<String> = ArmorSlot::ALL
+            .iter()
+            .copied()
+            .map(|s| {
+                let idx = s.index();
+                let dur = self.armor_cur_durability(s);
+                if self.armor_total[idx] == 0 {
+                    "？".to_string() // 未曾获得
+                } else if dur == 0 {
+                    // 碎裂
+                    "\x1b[90m✗".to_string()
+                } else if self.armor_worn[idx] {
+                    format!("{armor_color}[x]{dur}{reset}")
+                } else {
+                    // 获得了但未穿戴
+                    format!("{armor_color}[ ]{dur}{reset}")
+                }
+            })
+            .collect();
+        parts.join(" ")
+    }
+
+    /// 盔甲穿戴菜单（模态，按 e/ESC 关闭；1-4 穿戗/脱下对应部位）。
+    pub(crate) fn render_armor_menu(&self, out: &mut String) {
+        const RESET: &str = "\x1b[0m";
+        const CYAN: &str = "\x1b[36m";
+        const GREEN: &str = "\x1b[32m";
+        const GREY: &str = "\x1b[90m";
+        const ORANGE: &str = "\x1b[38;5;214m";
+        out.push_str(&format!("{ORANGE}盔 甲 穿 戴（按 e 关闭，按 1-4 切换）{RESET}\r\n\r\n"));
+        for s in ArmorSlot::ALL {
+            let idx = s.index();
+            let dur = self.armor_cur_durability(s);
+            let worn = self.is_worn(s);
+            let key = match s {
+                ArmorSlot::Helmet => '1',
+                ArmorSlot::Chest => '2',
+                ArmorSlot::Legs => '3',
+                ArmorSlot::Bracer => '4',
+            };
+            // 库存备份数量 = 拥有总数 - 1（正在用的那件）
+            let stock = self.armor_total[idx].saturating_sub(1);
+            let (box_mark, color) = if self.armor_total[idx] == 0 {
+                ("[ ]", GREY)
+            } else if dur == 0 {
+                // 碎裂：本局不可再穿
+                ("[×]", GREY)
+            } else if worn {
+                ("[x]", GREEN)
+            } else {
+                ("[ ]", CYAN)
+            };
+            let dur_text = if self.armor_total[idx] == 0 {
+                "没有".to_string()
+            } else if dur == 0 {
+                "碎裂".to_string()
+            } else {
+                format!("{dur}/{ARMOR_MAX_DURABILITY}")
+            };
+            let stock_note = if self.armor_total[idx] == 0 {
+                "存0".to_string()
+            } else if dur == 0 {
+                // 碎裂部位：结算后库存顶上
+                format!("碎裂（存{stock}）")
+            } else {
+                format!("存{stock}")
+            };
+            out.push_str(&format!(
+                "{color}[{key}] {mark} {name}  {dur_text}  {stock_note}{RESET}\r\n",
+                key = key,
+                mark = box_mark,
+                name = s.name(),
+                dur_text = dur_text,
+                stock_note = stock_note,
+            ));
+        }
         out.push_str(&format!("\r\n{}\r\n", self.msg));
     }
 
@@ -1711,6 +2158,76 @@ pub(crate) fn block_with_shield(
         blocked: true,
         refilled,
     }
+}
+/// 把一次怪物伤害 K 经盔甲减伤后应用到玩家 HP，并结算耐久消耗。
+/// 已穿戴部位按 factor 连乘保留（头盔 0.5、胸甲 0.6、腿甲 0.8、护腕 0.9）；
+/// 每受到的 1 点最终伤害使每个已穿戴部位均摊损耗 1 耐久。
+/// 耐久归零的部位碎裂并自动脱下（本局不可再穿，等待结算用库存顶上）。
+/// 最小结算 1 点伤害（盔甲不会让你完全无伤）。返回玩家实际掉血。
+///
+/// 之所以做成自由函数（而非 &mut self 方法），是因为怪物回合用
+/// `for m in self.monsters.iter_mut()` 持有一个 `self.monsters` 的借用；
+/// 传入互斥字段（armor_worn / armor_cur / player.hp）才能在怪物循环内调用。
+pub(crate) fn take_armor_damage(
+    armor_worn: &mut [bool; 4],
+    armor_cur: &mut ArmorDurability,
+    player_hp: &mut i32,
+    raw: i32,
+    hits: &mut Vec<String>,
+) -> i32 {
+    if raw <= 0 {
+        return 0;
+    }
+    let worn: Vec<(ArmorSlot, usize, f64)> = ArmorSlot::ALL
+        .iter()
+        .copied()
+        .filter_map(|s| {
+            let idx = s.index();
+            if armor_worn[idx] {
+                Some((s, idx, s.factor()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let lose = if worn.is_empty() {
+        // 未穿甲：全额受伤，无耐久消耗
+        raw
+    } else {
+        // 各部位 factor 连乘 → 生存/保留系数
+        let mult: f64 = worn.iter().map(|(_, _, f)| *f).product();
+        let reduced = ((raw as f64) * mult).round().max(1.0) as i32;
+        // 耐久消耗 = 承受的最终伤害（抵消后），均摊给每个已穿戴部位
+        let n = worn.len() as i32;
+        let base = reduced / n;
+        let rem = reduced % n;
+        for (i, (slot, idx, _)) in worn.iter().enumerate() {
+            let cost = base + if (i as i32) < rem { 1 } else { 0 };
+            if cost <= 0 {
+                continue;
+            }
+            let d = match slot {
+                ArmorSlot::Helmet => &mut armor_cur.helmet,
+                ArmorSlot::Chest => &mut armor_cur.chest,
+                ArmorSlot::Legs => &mut armor_cur.legs,
+                ArmorSlot::Bracer => &mut armor_cur.bracer,
+            };
+            *d -= cost;
+            if *d < 0 {
+                *d = 0;
+            }
+            if *d == 0 && armor_worn[*idx] {
+                armor_worn[*idx] = false;
+                hits.push(format!(
+                    "（{} 耐久耗尽碎裂了！本局无法再穿戴，结算后有库存可顶上）",
+                    slot.name()
+                ));
+            }
+        }
+        reduced
+    };
+    *player_hp -= lose;
+    lose
 }
 
 /// 层数怪物血量缩放：1-7 层分别 ×1、×1.5、×2、×2.5、×3、×3.5、×4。

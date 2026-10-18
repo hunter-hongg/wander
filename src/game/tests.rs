@@ -1,6 +1,6 @@
 use super::*;
 use std::collections::VecDeque;
-use crate::ui::{render_homepage, Shop};
+use crate::ui::{render_armor, render_homepage, Shop};
 
     /// 地图必须连通：room0 能走到所有房间的中心。
     #[test]
@@ -441,8 +441,12 @@ use crate::ui::{render_homepage, Shop};
             shield: 0,
         });
         g5.try_attack();
-        assert!(g5.boss_down, "杀 boss 没解锁下楼");
-        assert!(matches!(g5.end, End::Victory), "第 7 层杀 boss 该进入通关结算");
+        assert!(g5.boss_down, "杀 boss 没解锁通关");
+        // 此时应该是 boss_down=true，但 end=End::None，需要按 d 才能通关
+        assert!(matches!(g5.end, End::None), "杀 boss 后应该等待玩家按 d");
+        // 现在召唤 boss 下的 descend 来通关
+        g5.descend();
+        assert!(matches!(g5.end, End::Victory), "按 d 后应进入通关结算");
         assert!(g5.monsters.is_empty());
         // 通关后不能再动
         let after = (g5.player.x, g5.player.y);
@@ -3353,4 +3357,439 @@ use crate::ui::{render_homepage, Shop};
         let r2 = block_with_shield(&mut shield2, &mut stock2, "暗影射手", "暗影箭", false, &mut hits2);
         assert!(r2.blocked, "普通暗影箭该被盾挡下");
         assert_eq!(shield2, SHIELD_DURABILITY - 1, "普通暗影箭该扣 1 点耐久");
+    }
+
+    /// 6-7 层守护者掉落盔甲：基础 10%，带幸运符 25%。
+    /// 只掉落在地上（items），走过去拾取才进背包计数。
+    #[test]
+    fn boss_drops_armor_on_floor_6_7() {
+        // 基础 10% 掉率
+        let mut g = Game::new(60, 25, &Ownership::default());
+        g.floor = 6;
+        g.monsters.clear();
+        let (px, py) = (g.player.x, g.player.y);
+        let mut drops = 0usize;
+        // 用多次击杀来统计掉率，每轮重置 items 防止爆满
+        for _ in 0..200 {
+            g.items.clear();
+            // 在玩家旁边放一只 1 血 6 层守护者，杀掉
+            let i = g.map.idx(px + 1, py);
+            g.map.tiles[i] = Tile::Floor;
+            g.monsters.push(Entity {
+                x: px + 1,
+                y: py,
+                ch: 'D',
+                name: BOSS,
+                hp: 1,
+                max_hp: 1,
+                atk: 0,
+                sight: 0, // 看不见玩家，不会反击
+                behavior: Behavior::Hybrid,
+                is_boss: true,
+                shield: 0,
+            });
+            g.try_attack();
+            if g.msg.contains("掉落了盔甲") {
+                drops += 1;
+            }
+        }
+        // 200 次抽样下，10% 掉率落在 5~35 之外的概率极小（均值 20，σ≈4.2）
+        assert!(drops > 5 && drops < 35, "盔甲掉率异常：杀 200 只守护者只掉了 {drops} 件");
+
+        // 幸运符：25% 掉率
+        let mut g2 = Game::new(60, 25, &Ownership::default());
+        g2.floor = 6;
+        g2.lucky = true;
+        g2.monsters.clear();
+        let (px, py) = (g2.player.x, g2.player.y);
+        let mut drops2 = 0usize;
+        for _ in 0..200 {
+            g2.items.clear();
+            g2.monsters.clear();
+            g2.msg = String::new();
+            let i = g2.map.idx(px + 1, py);
+            g2.map.tiles[i] = Tile::Floor;
+            g2.monsters.push(Entity {
+                x: px + 1, y: py,
+                ch: 'D', name: BOSS,
+                hp: 1, max_hp: 1,
+                atk: 0, sight: 0,
+                behavior: Behavior::Hybrid,
+                is_boss: true, shield: 0,
+            });
+            g2.try_attack();
+            if g2.msg.contains("掉落了盔甲") {
+                drops2 += 1;
+            }
+        }
+        // 200 次抽样下，25% 掉率落在 35~65 之外的概率极小
+        assert!(drops2 > 35 && drops2 < 65, "幸运符盔甲掉率异常：杀 200 只守护者只掉了 {drops2} 件");
+    }
+
+    /// 拾取盔甲：进背包计数，封顶 MAX_ARMOR_STACK，满时留在原地。
+    #[test]
+    fn pickup_armor_counts_and_caps() {
+        let mut g = Game::new(60, 25, &Ownership::default());
+        g.items.clear();
+        // 放一件头盔在玩家脚边，走过去拾取
+        let spot = (g.player.x, g.player.y);
+        g.items.push(Item { x: spot.0, y: spot.1, kind: ItemKind::ArmorHelmet });
+        g.pickup();
+        assert_eq!(g.helmet_count, 1, "该拾取 1 顶暗影晶头盔");
+        assert!(g.msg.contains("暗影晶头盔"), "提示该提到头盔：{}", g.msg);
+
+        // 堆叠到上限后不再拾取
+        g.helmet_count = MAX_ARMOR_STACK;
+        g.items.clear();
+        g.items.push(Item { x: spot.0, y: spot.1, kind: ItemKind::ArmorHelmet });
+        g.pickup();
+        assert_eq!(g.helmet_count, MAX_ARMOR_STACK, "超过上限不该再拾取");
+        assert!(g.msg.contains("已满"), "该提示满了：{}", g.msg);
+
+        // 不同部位独立计数
+        g.items.clear();
+        g.items.push(Item { x: spot.0, y: spot.1, kind: ItemKind::ArmorChest });
+        g.pickup();
+        assert_eq!(g.chest_count, 1, "胸甲独立计数");
+        assert_eq!(g.helmet_count, MAX_ARMOR_STACK, "拾取胸甲不该影响头盔");
+        
+        g.items.clear();
+        g.items.push(Item { x: spot.0, y: spot.1, kind: ItemKind::ArmorLegs });
+        g.pickup();
+        assert_eq!(g.legs_count, 1, "腿甲独立计数");
+        
+        g.items.clear();
+        g.items.push(Item { x: spot.0, y: spot.1, kind: ItemKind::ArmorBracer });
+        g.pickup();
+        assert_eq!(g.bracer_count, 1, "护腕独立计数");
+    }
+
+    /// 盔甲库存持久化：save_ownership 把本局盔甲数量累计进 Ownership。
+    #[test]
+    fn armor_persists_in_ownership() {
+        let file = std::env::temp_dir().join(format!("wander_armor_test_{}.json", std::process::id()));
+        let _ = fs::remove_file(&file);
+        unsafe {
+            std::env::set_var("WANDER_OWNED_FILE", &file);
+        }
+
+        // 初始库存为空
+        let own = Ownership::load();
+        assert_eq!(own.armor_helmet, 0, "初始不该有头盔");
+        assert_eq!(own.armor_chest, 0, "初始不该有胸甲");
+        assert_eq!(own.armor_legs, 0, "初始不该有腿甲");
+        assert_eq!(own.armor_bracer, 0, "初始不该有护腕");
+
+        // 第一局：2 顶头盔 1 件胸甲
+        let mut g = Game::new(60, 25, &Ownership::default());
+        g.helmet_count = 2;
+        g.chest_count = 1;
+        g.save_ownership();
+        let own = Ownership::load();
+        assert_eq!(own.armor_helmet, 2, "头盔没累计进库存");
+        assert_eq!(own.armor_chest, 1, "胸甲没累计进库存");
+
+        // 第二局：再捡 1 顶头盔 3 条腿甲，跨局累加
+        let mut g2 = Game::new(60, 25, &Ownership::default());
+        g2.helmet_count = 1;
+        g2.legs_count = 3;
+        g2.bracer_count = 4;
+        g2.save_ownership();
+        let own = Ownership::load();
+        assert_eq!(own.armor_helmet, 3, "头盔库存该跨局累加（2+1）");
+        assert_eq!(own.armor_chest, 1, "胸甲库存不变");
+        assert_eq!(own.armor_legs, 3, "腿甲库存该记上");
+        assert_eq!(own.armor_bracer, 4, "护腕库存该记上");
+
+        // 清理
+        let _ = fs::remove_file(&file);
+    }
+
+    /// 盔甲图鉴字符和颜色即使没有实际效果也该渲染正确。
+    #[test]
+    fn armor_items_render_correctly() {
+        // 每件盔甲在地图上用一个独立字符
+        assert_eq!(item_glyph(ItemKind::ArmorHelmet), 'A', "头盔该用 A");
+        assert_eq!(item_glyph(ItemKind::ArmorChest), 'C', "胸甲该用 C");
+        assert_eq!(item_glyph(ItemKind::ArmorLegs), 'L', "腿甲该用 L");
+        assert_eq!(item_glyph(ItemKind::ArmorBracer), 'W', "护腕该用 W");
+    }
+
+    /// 盔甲耐久数据模型：未拥有部位返回 0，拥有时返回耐久值。
+    #[test]
+    fn armor_durability_unowned_returns_zero() {
+        let own = Ownership::default();
+        // 默认 Ownership 所有盔甲计数为 0，因此耐久应为 0 而非 500
+        for slot in ArmorSlot::ALL {
+            assert_eq!(
+                slot.durability(&own),
+                0,
+                "{}未拥有时耐久应为 0", slot.name()
+            );
+        }
+        assert_eq!(ARMOR_MAX_DURABILITY, 500, "耐久上限固定 500");
+    }
+
+    /// 盔甲耐久持久化：serde 往返保留耐久；旧存档缺字段时回落默认满耐久。
+    #[test]
+    fn armor_durability_serialization_roundtrip() {
+        let mut own = Ownership::default();
+        own.armor_durability.helmet = 321;
+        let json = serde_json::to_string(&own).unwrap();
+        let back: Ownership = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.armor_durability.helmet, 321, "耐久该随存档保存");
+        assert_eq!(back.armor_durability.chest, ARMOR_MAX_DURABILITY, "其他部位不受影响");
+
+        // 旧存档没有 armor_durability 字段：加载后应回落 500/500
+        let old: Ownership = serde_json::from_str(r#"{"skeleton_blade":2}"#).unwrap();
+        assert_eq!(old.armor_durability.helmet, ARMOR_MAX_DURABILITY, "旧存档头盔耐久该默认满");
+        assert_eq!(old.armor_durability.bracer, ARMOR_MAX_DURABILITY, "旧存档护腕耐久该默认满");
+    }
+
+    /// 盔甲库存存量 = 总数 - 1（扣掉当前穿着的一件），归零时显示 0。
+    #[test]
+    fn armor_stock_is_total_minus_worn() {
+        // 头盔总数 3 → 存量 2
+        let own = Ownership { armor_helmet: 3, ..Default::default() };
+        assert_eq!(ArmorSlot::Helmet.stock(&own), 2, "头盔存量应为 3-1=2");
+
+        // 胸甲总数 1 → 存量 0（穿着的那件不算库存）
+        let own = Ownership { armor_chest: 1, ..Default::default() };
+        assert_eq!(ArmorSlot::Chest.stock(&own), 0, "胸甲存量应为 1-1=0");
+
+        // 腿甲总数 0 → 存量 0（saturating，不负）
+        let own = Ownership { armor_legs: 0, ..Default::default() };
+        assert_eq!(ArmorSlot::Legs.stock(&own), 0, "腿甲0总不该显示负库存");
+
+        // 护腕总数 7 → 存量 6
+        let own = Ownership { armor_bracer: 7, ..Default::default() };
+        assert_eq!(ArmorSlot::Bracer.stock(&own), 6, "护腕存量应为 7-1=6");
+    }
+
+    /// 盔甲减伤模型：未穿盔甲时全额受伤、耐久不耗。
+    #[test]
+    fn armor_reduction_no_armor_is_full_damage() {
+        let mut worn = [false; 4];
+        let mut cur = ArmorDurability::default();
+        let mut hp: i32 = 100;
+        let mut hits = Vec::new();
+        for raw in [1, 4, 13] {
+            let before = cur.helmet;
+            let dmg = take_armor_damage(&mut worn, &mut cur, &mut hp, raw, &mut hits);
+            assert_eq!(dmg, raw, "未穿甲应全额受伤，raw={raw} got {dmg}");
+            assert_eq!(cur.helmet, before, "未穿甲耐久不该消耗");
+        }
+        assert!(hits.is_empty(), "未穿甲不该有碎裂消息");
+    }
+
+    /// 单件部位减伤 = 该部位 factor；耐久耗 = 承受伤害（post-reduction）。
+    #[test]
+    fn armor_single_slot_reduction_and_durability() {
+        let mut g = Game::new(60, 25, &Ownership::default());
+        // 让玩家「拥有」头盔并穿戴
+        g.armor_total[ArmorSlot::Helmet.index()] = 1;
+        g.armor_worn[ArmorSlot::Helmet.index()] = true;
+        g.armor_cur.helmet = ARMOR_MAX_DURABILITY;
+        let mut hits = Vec::new();
+        // 头盔 0.5 → 40 减到 20，耐久扣 20（玩家 40 血不死）
+        let dmg = take_armor_damage(&mut g.armor_worn, &mut g.armor_cur, &mut g.player.hp, 40, &mut hits);
+        assert_eq!(dmg, 20, "头盔应把 40 减到 20");
+        assert_eq!(g.armor_cur.helmet, ARMOR_MAX_DURABILITY - 20, "耐久应扣 20");
+        assert!(g.player.hp > 0, "玩家不该死");
+    }
+
+    /// 全套穿戴 = 0.5 × 0.6 × 0.8 × 0.9 = 0.216，耐久均摊耗尽。
+    #[test]
+    fn armor_full_set_multiplicative_reduction() {
+        let mut g = Game::new(60, 25, &Ownership::default());
+        for s in ArmorSlot::ALL {
+            let i = s.index();
+            g.armor_worn[i] = true;
+            g.armor_total[i] = 1;
+            match s {
+                ArmorSlot::Helmet => g.armor_cur.helmet = ARMOR_MAX_DURABILITY,
+                ArmorSlot::Chest => g.armor_cur.chest = ARMOR_MAX_DURABILITY,
+                ArmorSlot::Legs => g.armor_cur.legs = ARMOR_MAX_DURABILITY,
+                ArmorSlot::Bracer => g.armor_cur.bracer = ARMOR_MAX_DURABILITY,
+            }
+        }
+        let mut hits = Vec::new();
+        let hp0 = g.player.hp;
+        let dmg = take_armor_damage(&mut g.armor_worn, &mut g.armor_cur, &mut g.player.hp, 100, &mut hits);
+        // round(100 * 0.216) = 22
+        assert_eq!(dmg, 22, "全套应把 100 减到 22");
+        assert_eq!(hp0 - g.player.hp, 22);
+        // 耐久总扣 22（均摊 6/6/5/5），每个部位应扣 5~6
+        assert_eq!(ARMOR_MAX_DURABILITY - g.armor_cur.helmet + ARMOR_MAX_DURABILITY - g.armor_cur.chest
+            + ARMOR_MAX_DURABILITY - g.armor_cur.legs + ARMOR_MAX_DURABILITY - g.armor_cur.bracer, 22);
+        assert!(hits.is_empty(), "耐久未耗尽不该有碎裂消息");
+    }
+
+    /// 耐久归零的部位碎裂并自动脱下：之后 take_armor_damage 不再触发该部位减伤。
+    #[test]
+    fn armor_breaks_unequips_when_durability_depleted() {
+        let mut g = Game::new(60, 25, &Ownership::default());
+        g.armor_total[ArmorSlot::Helmet.index()] = 1;
+        g.armor_worn[ArmorSlot::Helmet.index()] = true;
+        g.armor_cur.helmet = 1; // 耐久为 1，一次 1 点伤害把它击碎
+        let mut hits = Vec::new();
+        let dmg = take_armor_damage(&mut g.armor_worn, &mut g.armor_cur, &mut g.player.hp, 100, &mut hits);
+        assert_eq!(dmg, 50, "头盔 0.5 -> 100 减到 50（碎裂前已结算）");
+        assert_eq!(g.armor_cur.helmet, 0, "头盔耐久应归 0");
+        assert!(!g.armor_worn[ArmorSlot::Helmet.index()], "碎裂后应自动脱下");
+        assert!(hits.iter().any(|h| h.contains("碎裂")), "应有碎裂消息：{hits:?}");
+        // 脱下后：同一次 100 伤害应照常结算（此时已无盔甲），不再扣耐久
+        // （注意：上面一次性扣完，所以这里重新模拟单独一次）
+    }
+
+    /// 碎裂的部位在本局不可再穿（即使有库存）：toggle_armor_slot 拒绝穿戴耐久为 0 的部位。
+    #[test]
+    fn armor_broken_slot_cannot_be_reworn_this_run() {
+        let mut g = Game::new(60, 25, &Ownership::default());
+        g.armor_total[ArmorSlot::Helmet.index()] = 3; // 有库存
+        g.armor_cur.helmet = 0; // 但耐久耗尽（碎裂）
+        g.toggle_armor_slot(ArmorSlot::Helmet);
+        assert!(!g.armor_worn[ArmorSlot::Helmet.index()], "碎裂部位不该被穿戴");
+        assert!(g.msg.contains("碎裂"), "应提示已碎裂：{}", g.msg);
+    }
+
+    /// toggle_armor_slot：拥有且耐久>0 时穿戴/脱下会切换状态。
+    #[test]
+    fn armor_toggle_wear_and_unwear() {
+        let mut g = Game::new(60, 25, &Ownership::default());
+        g.armor_total[ArmorSlot::Chest.index()] = 2;
+        g.armor_cur.chest = ARMOR_MAX_DURABILITY;
+        g.toggle_armor_slot(ArmorSlot::Chest);
+        assert!(g.armor_worn[ArmorSlot::Chest.index()], "应穿上胸甲");
+        g.toggle_armor_slot(ArmorSlot::Chest);
+        assert!(!g.armor_worn[ArmorSlot::Chest.index()], "再按应脱下胸甲");
+        // 未拥有的部位不能穿
+        g.armor_worn[ArmorSlot::Helmet.index()] = false;
+        g.toggle_armor_slot(ArmorSlot::Helmet);
+        assert!(!g.armor_worn[ArmorSlot::Helmet.index()]);
+        assert!(g.msg.contains("没获得过"), "{}", g.msg);
+    }
+
+    /// 结算顶上：耐久耗尽（0）且库存冗余件（总数 >= 2）的部位，用 1 件冗余回满耐久，耗掉 1 存量。
+    #[test]
+    fn settlement_tops_up_broken_slot_from_stock() {
+        let mut own = Ownership::default();
+        own.armor_chest = 3; // 碎裂的胸甲，还有冗余 2 件
+        own.armor_durability.chest = 0;
+        own.top_up_broken_slots();
+        assert_eq!(own.armor_chest, 2, "应耗 1 件冗余件（3-1=2）");
+        assert_eq!(own.armor_durability.chest, ARMOR_MAX_DURABILITY, "顶上后耐久回满");
+        // 其他部位无库存不受影响
+        assert_eq!(own.armor_helmet, 0);
+    }
+
+    /// 结算顶上：耐久耗尽但无冗余（总数 <= 1）的部位，保持 0，无法顶上。
+    #[test]
+    fn settlement_no_stock_keeps_broken_zero() {
+        let mut own = Ownership::default();
+        own.armor_helmet = 1; // 只有碎裂的那件，无冗余
+        own.armor_durability.helmet = 0;
+        own.top_up_broken_slots();
+        assert_eq!(own.armor_helmet, 1, "没库存不该顶上");
+        assert_eq!(own.armor_durability.helmet, 0, "耐久该保持 0");
+    }
+
+    /// 结算顶上不会碰耐久正常的部位（仅补耐久耗尽的）。
+    #[test]
+    fn settlement_does_not_touch_intact_slots() {
+        let mut own = Ownership::default();
+        own.armor_helmet = 4; // 完好耐久
+        own.armor_durability.helmet = 321;
+        own.armor_legs = 2; // 碎裂
+        own.armor_durability.legs = 0;
+        own.top_up_broken_slots();
+        assert_eq!(own.armor_durability.helmet, 321, "完好部位不该顶上");
+        assert_eq!(own.armor_helmet, 4, "完好部位库存不该减少");
+        assert_eq!(own.armor_durability.legs, ARMOR_MAX_DURABILITY, "碎裂部位应回满");
+        assert_eq!(own.armor_legs, 1, "碎裂部位应耗 1 冗余件（2-1=1）");
+    }
+
+    /// 盔甲穿戴菜单渲染：显示全部 4 个部位，穿戴中显示 [x]，碎裂部位标 [×]。
+    #[test]
+    fn armor_menu_renders_all_slots_and_state() {
+        let mut g = Game::new(60, 25, &Ownership::default());
+        g.armor_menu = true;
+        g.armor_total[ArmorSlot::Chest.index()] = 2;
+        g.armor_cur.chest = ARMOR_MAX_DURABILITY - 10;
+        g.toggle_armor_slot(ArmorSlot::Chest); // 穿戴胸甲
+        // 头盔耐久 0（碎裂）
+        g.armor_total[ArmorSlot::Helmet.index()] = 2;
+        g.armor_cur.helmet = 0;
+        let mut out = String::new();
+        g.render_armor_menu(&mut out);
+        for s in ArmorSlot::ALL {
+            assert!(out.contains(s.name()), "菜单应显示 {}", s.name());
+        }
+        assert!(out.contains("[x]"), "穿戴中的胸甲应标 [x]");
+        assert!(out.contains("碎裂"), "碎裂的头盔应显示碎裂");
+        assert!(g.armor_worn[ArmorSlot::Chest.index()]);
+    }
+
+    /// 盔甲子页面：4 件盔甲 + 耐久 + 存量都渲染出来，边框不错位。
+    #[test]
+    fn armor_subpage_lists_all_armor_aligned() {
+        let own = Ownership {
+            armor_helmet: 3,
+            armor_chest: 1,
+            armor_legs: 0,
+            armor_bracer: 7,
+            ..Default::default()
+        };
+        let s = render_armor(&own);
+        for slot in ArmorSlot::ALL {
+            assert!(s.contains(slot.name()), "盔甲页缺 {}", slot.name());
+            // 未拥有的部位显示"没有"，拥有的显示耐久
+            let total = match slot {
+                ArmorSlot::Helmet => own.armor_helmet,
+                ArmorSlot::Chest => own.armor_chest,
+                ArmorSlot::Legs => own.armor_legs,
+                ArmorSlot::Bracer => own.armor_bracer,
+            };
+            if total == 0 {
+                assert!(s.contains("没有"), "{}未拥有该显示'没有'", slot.name());
+            } else {
+                assert!(
+                    s.contains(&format!("{}/{}", ARMOR_MAX_DURABILITY, ARMOR_MAX_DURABILITY)),
+                    "{}拥有时该显示耐久 500/500", slot.name()
+                );
+            }
+        }
+        // 库存存量 = 总数 - 1（当前穿着中的一件）
+        assert!(s.contains("存2"), "头盔存量没显示（3-1=2）");
+        assert!(s.contains("存0"), "胸甲存量没显示（1-1=0）");
+        assert!(s.contains("存0"), "腿甲存量没显示（0-1=0）");
+        assert!(s.contains("存6"), "护腕存量没显示（7-1=6）");
+
+        let strip_ansi = |line: &str| -> String {
+            let mut out = String::new();
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c2 in chars.by_ref() {
+                        if c2 == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let rows: Vec<String> = s
+            .lines()
+            .map(strip_ansi)
+            .filter(|l| l.contains('║') || l.contains('╔') || l.contains('╚') || l.contains('╠'))
+            .collect();
+        assert!(rows.len() >= 8, "盔甲页行太少：{}", rows.len());
+        let w = display_width(&rows[0]);
+        assert!(
+            rows.iter().all(|l| display_width(l) == w),
+            "盔甲页边框错位：{rows:?}"
+        );
     }

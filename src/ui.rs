@@ -5,10 +5,11 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use std::io::Write;
-use crate::game::{display_width, MAX_POTION_BUY, Ownership, PRICE_MANUAL, PRICE_POTION, PRICE_TALISMAN, Purchase, Score};
+use crate::game::{display_width, ArmorSlot, MAX_POTION_BUY, Ownership, PRICE_MANUAL, PRICE_POTION, PRICE_TALISMAN, Purchase, Score, ARMOR_MAX_DURABILITY};
 
 pub(crate) enum HomepageResult {
     Start, // 按开始 → 进入商店
+    Armor, // 按 e → 进入盔甲子页面
     Quit,
 }
 
@@ -74,7 +75,22 @@ pub(crate) fn render_homepage(ownership: &Ownership, credits: u32) -> String {
     };
     out.push_str(&weapon_row("B 暗影弓", BOW_COLOR, &bow_text, bow_color));
     out.push_str(&format!("{GOLD}╠{bar}╣{RESET}\r\n"));
+    // 盔甲收藏展示：4 件分布展示
+    let armor_text = format!(
+        "头{} 胸{} 腿{} 腕{}",
+        ownership.armor_helmet, ownership.armor_chest,
+        ownership.armor_legs, ownership.armor_bracer,
+    );
+    let armor_color = if ownership.armor_helmet > 0 || ownership.armor_chest > 0
+        || ownership.armor_legs > 0 || ownership.armor_bracer > 0 {
+        GREEN
+    } else {
+        RED
+    };
+    out.push_str(&weapon_row("暗影晶甲", BOW_COLOR, &armor_text, armor_color));
+    out.push_str(&format!("{GOLD}╠{bar}╣{RESET}\r\n"));
     out.push_str(&centered_row("按 b 开始游戏"));
+    out.push_str(&centered_row("按 e 查看盔甲"));
     out.push_str(&centered_row("按 q 退出游戏"));
     out.push_str(&format!("{GOLD}╚{bar}╝{RESET}\r\n"));
     out
@@ -101,7 +117,94 @@ pub(crate) fn run_homepage(stdout: &mut std::io::Stdout) -> std::io::Result<Home
                 KeyCode::Char('b') | KeyCode::Enter | KeyCode::Char(' ') => {
                     return Ok(HomepageResult::Start);
                 }
+                KeyCode::Char('e') => return Ok(HomepageResult::Armor),
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(HomepageResult::Quit),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 盔甲子页面面板：展示永久库存每个部位当前穿戴耐久的数值与库存冗余件数量。
+/// 未拥有的部位显示"没有"；耐久随受击消耗并跨局持久化。
+pub(crate) fn render_armor(ownership: &Ownership) -> String {
+    const GOLD: &str = "\x1b[33m";
+    const GREEN: &str = "\x1b[32m";
+    const CYAN: &str = "\x1b[36m";
+    const RESET: &str = "\x1b[0m";
+    const INNER: usize = 38;
+
+    let mut out = String::new();
+    let bar = "═".repeat(INNER);
+
+    let centered_row = |content: &str| -> String {
+        let pad = INNER.saturating_sub(display_width(content));
+        let left = pad / 2;
+        let right = pad - left;
+        format!(
+            "{GOLD}║{RESET}{}{content}{}{GOLD}║{RESET}\r\n",
+            " ".repeat(left),
+            " ".repeat(right)
+        )
+    };
+    // 左对齐盔甲名 + 右侧耐久/存量
+    let armor_row = |slot: ArmorSlot| -> String {
+        let name = slot.name();
+        let dur = slot.durability(ownership);
+        let stock = slot.stock(ownership);
+        let status = if dur == 0 && stock == 0 {
+            format!("没有 · 存0")
+        } else {
+            format!("{dur}/{ARMOR_MAX_DURABILITY} · 存{stock}")
+        };
+        let name_w = display_width(name);
+        let status_w = display_width(&status);
+        let left_pad = 2;
+        let right_pad = 2;
+        let gap = 4;
+        let fill = INNER.saturating_sub(left_pad + name_w + gap + status_w + right_pad);
+        format!(
+            "{GOLD}║{RESET}  {CYAN}{name}{RESET}{}{}{GREEN}{status}{RESET}  {GOLD}║{RESET}\r\n",
+            " ".repeat(gap),
+            " ".repeat(fill)
+        )
+    };
+
+    out.push_str(&format!("{GOLD}╔{bar}╗{RESET}\r\n"));
+    out.push_str(&centered_row("盔 甲 图 鉴"));
+    out.push_str(&format!("{GOLD}╠{bar}╣{RESET}\r\n"));
+    out.push_str(&centered_row("耐久随受击消耗（跨局持久）"));
+    out.push_str(&format!("{GOLD}╠{bar}╣{RESET}\r\n"));
+    for slot in ArmorSlot::ALL {
+        out.push_str(&armor_row(slot));
+    }
+    out.push_str(&format!("{GOLD}╠{bar}╣{RESET}\r\n"));
+    out.push_str(&centered_row("按 b / Esc 回首页"));
+    out.push_str(&format!("{GOLD}╚{bar}╝{RESET}\r\n"));
+    out
+}
+
+/// 盔甲子页面交互循环：任意返回键回到首页。
+pub(crate) fn run_armor(stdout: &mut std::io::Stdout) -> std::io::Result<()> {
+    let ownership = Ownership::load();
+    loop {
+        execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+        write!(stdout, "{}", render_armor(&ownership))?;
+        stdout.flush()?;
+
+        if !event::poll(std::time::Duration::from_millis(50))? {
+            continue;
+        }
+        let ev = event::read()?;
+        if let Event::Key(k) = ev {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            match k.code {
+                KeyCode::Char('b') | KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
+                    return Ok(())
+                }
+                KeyCode::Char('q') => return Ok(()),
                 _ => {}
             }
         }
